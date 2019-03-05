@@ -1,3 +1,51 @@
+# Good Line Cutting Version of PL-SLAM
+
+Good line cutting is an enhancement module that is designed for line-assisted VSLAM, such as PL-SLAM.  The primary objective of good line cutting is to pre-condition line-assisted pose optimization, therefore improving the robustness of optimization under 3D line triangulation error.
+
+<figure>
+  <img src="https://github.com/YipuZhao/GF_ORB_SLAM/blob/master/batch_script/RMSE_vs_Latency_EuRoC.png" alt="EuRoC" style="width:100%">
+  <figcaption>Performance vs. latency evaluation on EuRoC monocular sequences (left-cam only)</figcaption>
+</figure>
+
+## Build & Run
+
+This repo is an integration of good line cutting to stereo PL-SLAM.  When tested on multiple challenging scenarios that point feature may fail, GF-PL-SLAM has better performance than PL-SLAM baseline and other state-of-the-art stereo SLAM systems.
+
+To build GF-PL-SLAM, first clone the repo to your ros workspace
+
+	git clone git@github.com:YipuZhao/GF_PL_SLAM.git
+
+Build dependencies for GF-PL-SLAM with
+
+	./build_dep.sh
+
+Build the GF-PL-SLAM itself
+
+	./build.sh
+
+With the head version of g2o, it's possible to prompt error when building GF-PL-SLAM.  When getting error like "no matching function for BlockSolver XXX", refer to the fix at 
+
+	https://github.com/rubengooj/pl-slam/issues/29
+
+To run GF-PL-SLAM, please refer to some example batch evaluation scripts at folder 
+
+	batch_script
+
+## Reference
+
+If you use GF-PL-SLAM in an academic work, please cite:
+
+	@inproceedings{zhao2018good,
+	  title={Good Line Cutting: towards Accurate Pose Tracking of Line-assisted VO/VSLAM},
+	  author={Zhao, Yipu and Vela, Patricio A},
+	  booktitle={Proceedings of the European Conference on Computer Vision (ECCV)},
+	  pages={516--531},
+	  year={2018}
+	}
+
+---
+
+
 Notice that this repository is only an open-source version of PL-SLAM released with the aim of being useful for the community, however, it is far from being optimized and we are not including some features of PL-SLAM.
 
 # PL-SLAM #

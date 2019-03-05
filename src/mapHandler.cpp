@@ -1,55 +1,42 @@
 /*****************************************************************************
-**      Stereo VO and SLAM by combining point and line segment features     **
+**   PL-SLAM: stereo visual SLAM with points and line segment features  	**
 ******************************************************************************
-**                                                                          **
-**  Copyright(c) 2016-2018, Ruben Gomez-Ojeda, University of Malaga         **
-**  Copyright(c) 2016-2018, David Zuñiga-Noël, University of Malaga         **
-**  Copyright(c) 2016-2018, MAPIR group, University of Malaga               **
-**                                                                          **
-**  This program is free software: you can redistribute it and/or modify    **
-**  it under the terms of the GNU General Public License (version 3) as     **
-**  published by the Free Software Foundation.                              **
-**                                                                          **
-**  This program is distributed in the hope that it will be useful, but     **
-**  WITHOUT ANY WARRANTY; without even the implied warranty of              **
-**  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the            **
-**  GNU General Public License for more details.                            **
-**                                                                          **
-**  You should have received a copy of the GNU General Public License       **
-**  along with this program.  If not, see <http://www.gnu.org/licenses/>.   **
-**                                                                          **
+**																			**
+**	Copyright(c) 2017, Ruben Gomez-Ojeda, University of Malaga              **
+**	Copyright(c) 2017, MAPIR group, University of Malaga					**
+**																			**
+**  This program is free software: you can redistribute it and/or modify	**
+**  it under the terms of the GNU General Public License (version 3) as		**
+**	published by the Free Software Foundation.								**
+**																			**
+**  This program is distributed in the hope that it will be useful, but		**
+**	WITHOUT ANY WARRANTY; without even the implied warranty of				**
+**  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the			**
+**  GNU General Public License for more details.							**
+**																			**
+**  You should have received a copy of the GNU General Public License		**
+**  along with this program.  If not, see <http://www.gnu.org/licenses/>.	**
+**																			**
 *****************************************************************************/
 
-#include "mapHandler.h"
-
-#include <iostream>
-#include <opencv2/imgproc.hpp>
-
-#include <matching.h>
-#include <timer.h>
+#include <mapHandler.h>
 
 namespace PLSLAM
 {
 
 MapHandler::MapHandler(PinholeStereoCamera* cam_)
-    : cam(cam_), threads_started(false)
 {
+    cam = cam_;
     // load vocabulary
-    if( SlamConfig::hasPoints() )
-        dbow_voc_p.load( SlamConfig::dbowVocP() );
-    if( SlamConfig::hasLines() )
-        dbow_voc_l.load( SlamConfig::dbowVocL() );
-
-    lc_state = LC_IDLE;
+    if( Config::hasPoints() )
+        dbow_voc_p.load( Config::dbowVocP() );
+    if( Config::hasLines() )
+        dbow_voc_l.load( Config::dbowVocL() );
 
 }
 
 void MapHandler::initialize( KeyFrame *kf0 )
 {
-    curr_kf = kf0;
-
-    Twf = Matrix4d::Identity();
-    DT = Matrix4d::Identity();
 
     // reset information from the map
     map_keyframes.clear();
@@ -74,14 +61,14 @@ void MapHandler::initialize( KeyFrame *kf0 )
     conf_matrix[0][0] = 1.0;
 
     // reset indices
-    for (PointFeature* pt : kf0->stereo_frame->stereo_pt)
-        pt->idx = -1;
-    for (LineFeature* ls : kf0->stereo_frame->stereo_ls)
-        ls->idx = -1;
+    for( vector<PointFeature*>::iterator it = kf0->stereo_frame->stereo_pt.begin(); it != kf0->stereo_frame->stereo_pt.end(); it++)
+        (*it)->idx = -1;
+    for( vector<LineFeature*>::iterator  it = kf0->stereo_frame->stereo_ls.begin(); it != kf0->stereo_frame->stereo_ls.end(); it++)
+        (*it)->idx = -1;
 
     // initialize DBoW descriptor vector and LC status
     vector<Mat> curr_desc;
-    if( SlamConfig::hasPoints() )
+    if( Config::hasPoints() )
     {
         curr_desc.reserve( kf0->stereo_frame->pdesc_l.rows );
         for ( int i = 0; i < kf0->stereo_frame->pdesc_l.rows; i++ )
@@ -89,13 +76,14 @@ void MapHandler::initialize( KeyFrame *kf0 )
         dbow_voc_p.transform( curr_desc, kf0->descDBoW_P );
         curr_desc.clear();
     }
-    if( SlamConfig::hasLines() )
+    if( Config::hasLines() )
     {
         curr_desc.reserve( kf0->stereo_frame->ldesc_l.rows );
         for ( int i = 0; i < kf0->stereo_frame->ldesc_l.rows; i++ )
             curr_desc.push_back( kf0->stereo_frame->ldesc_l.row(i) );
         dbow_voc_l.transform( curr_desc, kf0->descDBoW_L );
     }
+    lc_status = LC_IDLE;
 
     // insert keyframe and add to map of indexes
     vector<int> aux_vec;
@@ -103,66 +91,29 @@ void MapHandler::initialize( KeyFrame *kf0 )
     map_points_kf_idx.insert( std::pair<int,vector<int>>(kf0->kf_idx,aux_vec) );
     map_lines_kf_idx.insert(  std::pair<int,vector<int>>(kf0->kf_idx,aux_vec) );
 
-    if (SlamConfig::multithreadSLAM())
-        startThreads();
-
-    time = Vector7f::Zero();
 }
 
 void MapHandler::finishSLAM()
 {
-    if (SlamConfig::multithreadSLAM())
-        killThreads();
+
+    // close loop if there is an active LC
+    if( lc_status == LC_ACTIVE || lc_status == LC_READY )
+    {
+        loopClosureOptimizationCovGraphG2O();
+        // if succesfully closed
+        lc_status = LC_IDLE;
+        lc_idxs.clear();
+        lc_poses.clear();
+        lc_pt_idxs.clear();
+        lc_ls_idxs.clear();
+    }
+
 }
 
 void MapHandler::addKeyFrame( KeyFrame *curr_kf )
 {
-    Timer timer;
-
-    this->prev_kf = this->curr_kf;
-    this->curr_kf = curr_kf;
-
-    if( SlamConfig::multithreadSLAM() )
-    {
-        // expand graphs
-        expandGraphs();
-        // select previous keyframe
-        KeyFrame* prev_kf;
-        prev_kf = map_keyframes.back();
-        max_kf_idx++;
-        curr_kf->kf_idx = max_kf_idx;
-        curr_kf->local  = true;
-        // update pose of current keyframe wrt previous one (in case of LC)
-        Matrix4d T_curr_w = prev_kf->T_kf_w * curr_kf->T_kf_w;
-        curr_kf->x_kf_w = logmap_se3(T_curr_w);
-        curr_kf->T_kf_w = expmap_se3(curr_kf->x_kf_w);
-        // Estimates Twf
-        Twf = expmap_se3(logmap_se3(  inverse_se3( curr_kf->T_kf_w ) ));
-        // estimates pose increment
-        DT = expmap_se3(logmap_se3( Twf * prev_kf->T_kf_w ));
-        // reset indices
-        for (PointFeature* pt : curr_kf->stereo_frame->stereo_pt)
-            pt->idx = -1;
-        for (LineFeature* ls : curr_kf->stereo_frame->stereo_ls)
-            ls->idx = -1;
-        // insert keyframe and add to map of indexes
-        vector<int> aux_vec;
-        map_keyframes.push_back( curr_kf );
-        map_points_kf_idx.insert( std::make_pair(curr_kf->kf_idx, aux_vec) );
-        map_lines_kf_idx.insert(  std::make_pair(curr_kf->kf_idx, aux_vec) );
-        // call
-        addKeyFrame_multiThread(curr_kf,prev_kf);
-        return;
-    }
-
-
-    // reset time variable
-    time = Vector7f::Zero();
-
     // expand graphs
-    timer.start();
     expandGraphs();
-    time(0) = timer.stop(); //ms
 
     // select previous keyframe
     KeyFrame* prev_kf;
@@ -173,386 +124,410 @@ void MapHandler::addKeyFrame( KeyFrame *curr_kf )
 
     // update pose of current keyframe wrt previous one (in case of LC)
     Matrix4d T_curr_w = prev_kf->T_kf_w * curr_kf->T_kf_w;
+    curr_kf->T_kf_w = T_curr_w;
     curr_kf->x_kf_w = logmap_se3(T_curr_w);
-    curr_kf->T_kf_w = expmap_se3(curr_kf->x_kf_w);
-
-    // Estimates Twf
-    Twf = expmap_se3(logmap_se3(  inverse_se3( curr_kf->T_kf_w ) ));
-
-    // estimates pose increment
-    DT = expmap_se3(logmap_se3( Twf * prev_kf->T_kf_w ));
 
     // reset indices
-    for (PointFeature* pt : curr_kf->stereo_frame->stereo_pt)
-        pt->idx = -1;
-    for (LineFeature* ls : curr_kf->stereo_frame->stereo_ls)
-        ls->idx = -1;
+    for( vector<PointFeature*>::iterator it = curr_kf->stereo_frame->stereo_pt.begin(); it != curr_kf->stereo_frame->stereo_pt.end(); it++)
+        (*it)->idx = -1;
+    for( vector<LineFeature*>::iterator  it = curr_kf->stereo_frame->stereo_ls.begin(); it != curr_kf->stereo_frame->stereo_ls.end(); it++)
+        (*it)->idx = -1;
 
     // look for common matches and update the full graph
-    timer.start();
     lookForCommonMatches( prev_kf, curr_kf );
-    time(1) = timer.stop(); //ms
-
-    timer.start();
-    if( SlamConfig::hasPoints() && SlamConfig::hasLines() )
+    if( Config::hasPoints() && Config::hasLines() )
         insertKFBowVectorPL(curr_kf);
-    else if( SlamConfig::hasPoints() )
+    else if( Config::hasPoints() && !Config::hasLines() )
         insertKFBowVectorP(curr_kf);
-    else if( SlamConfig::hasLines() )
+    else if( !Config::hasPoints() && Config::hasLines() )
         insertKFBowVectorL(curr_kf);
 
-    time(2) = timer.stop(); //ms
-
     // insert keyframe and add to map of indexes
+    clock.Tic();
     vector<int> aux_vec;
     map_keyframes.push_back( curr_kf );
-    map_points_kf_idx.insert( std::make_pair(curr_kf->kf_idx, aux_vec) );
-    map_lines_kf_idx.insert(  std::make_pair(curr_kf->kf_idx, aux_vec) );
+    map_points_kf_idx.insert( std::pair<int,vector<int>>(curr_kf->kf_idx,aux_vec) );
+    map_lines_kf_idx.insert(  std::pair<int,vector<int>>(curr_kf->kf_idx,aux_vec) );
 
     // form local map
-    timer.start();
     formLocalMap();
-    time(3) = timer.stop(); //ms
+
+//    time(0) = 1000 * clock.Tac(); //ms
+
+    // DO NOT USE!
+    // seem to be super slow and buggy; keep this line commented out
+    // fuse similar 3D landmarks from local map
+    //    fuseLandmarksFromLocalMap();
 
     // perform local bundle adjustment
-    timer.start();
     localBundleAdjustment();
-    time(4) = timer.stop(); //ms
+
+//    time(1) = 1000 * clock.Tac(); //ms
 
     // Recent map LMs culling (implement filters for line segments, which seems to be unaccurate)
-    timer.start();
     removeBadMapLandmarks();
-    time(5) = timer.stop(); //ms
+
+//    time(2) = 1000 * clock.Tac(); //ms
+
+//    removeRedundantKFs();
+
+//    time(3) = 1000 * clock.Tac(); //ms
 
 
-    // LC
-    timer.start();
-    loopClosure();
-    time(6) = timer.stop(); //ms
+//    std::cout << "time cost break down: " << std::endl
+//              << "formLocalMap " << time(0) << std::endl
+//              << "localBundleAdjustment " << time(1) << std::endl
+//              << "removeBadMapLandmarks " << time(2) << std::endl
+//              << "removeRedundantKFs " << time(3) << std::endl;
+
+
+    // Check for loop closures
+    //    loopClosure();
+
 }
 
-int MapHandler::matchKF2KFPoints(KeyFrame *prev_kf, KeyFrame *curr_kf) {
+void MapHandler::lookForCommonMatches( KeyFrame* kf0, KeyFrame* &kf1 )
+{
 
-    int kf1_idx = prev_kf->kf_idx;
-    int kf2_idx = curr_kf->kf_idx;
+    // grab frame number
+    int kf0_idx = kf0->kf_idx;
+    int kf1_idx = kf1->kf_idx;
 
-    StVO::StereoFrame* prev_frame = prev_kf->stereo_frame;
-    StVO::StereoFrame* curr_frame = curr_kf->stereo_frame;
+    // estimates pose increment
+    Matrix4d DT = inverse_se3( kf1->T_kf_w ) * kf0->T_kf_w;
 
-    matched_pt.clear();
-    if (!SlamConfig::hasPoints() || curr_frame->stereo_pt.empty() || prev_frame->stereo_pt.empty())
-        return 0;
+    // Estimates Twf
+    Matrix4d Twf = inverse_se3( kf1->T_kf_w );
 
-    int matches = 0;
-    vector<int> matches_12;
+    bool has_refinement = false;
+    list<PointFeature*> matched_pt;
+    list<LineFeature*>  matched_ls;
 
-    // small window; if it fails, run standard matching
-    if (SlamConfig::fastMatching()) {
-        std::vector<point_2d> pj_points;
-        pj_points.reserve(prev_frame->stereo_pt.size());
-
-        for (PointFeature* pt : prev_frame->stereo_pt) {
-            Vector2d point = cam->projection( DT.block(0,0,3,3) * pt->P + DT.col(3).head(3) );
-            pj_points.push_back(std::make_pair(point(0) * curr_frame->inv_width, point(1) * curr_frame->inv_height));
-        }
-
-        //Fill in grid
-        GridStructure grid(GRID_ROWS, GRID_COLS);
-        for (int idx = 0; idx < curr_frame->stereo_pt.size(); ++idx) {
-            PointFeature* point = curr_frame->stereo_pt[idx];
-            grid.at(point->pl(0) * curr_frame->inv_width, point->pl(1) * curr_frame->inv_height).push_back(idx);
-        }
-
-        GridWindow w;
-        int ws = SlamConfig::matchingF2FWs();
-        w.width = std::make_pair(ws, ws);
-        w.height = std::make_pair(ws, ws);
-
-        matches = matchGrid(pj_points, prev_frame->pdesc_l, grid, curr_frame->pdesc_l, w, matches_12);
-    }
-
-    if (curr_frame->stereo_pt.size() > SlamConfig::minPointMatches() &&
-            prev_frame->stereo_pt.size() > SlamConfig::minPointMatches() &&
-            matches < SlamConfig::minPointMatches()) {
-        matches = match(prev_frame->pdesc_l, curr_frame->pdesc_l, SlamConfig::minRatio12P(), matches_12);
-    }
-
-    for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-        const int i2 = matches_12[i1];
-        if (i2 < 0) continue;
-
-        // this shouldn't happen
-        if (prev_frame->stereo_pt[i1] == nullptr)
-            throw runtime_error("[MapHandler] NULL stereo point (prev)");
-        if (curr_frame->stereo_pt[i2] == nullptr)
-            throw runtime_error("[MapHandler] NULL stereo point (curr)");
-
-        // new 3D landmark
-        if( prev_frame->stereo_pt[i1]->idx == -1 ) {
-            // assign indices
-            prev_frame->stereo_pt[i1]->idx = max_pt_idx;
-            curr_frame->stereo_pt[i2]->idx = max_pt_idx;
-            // create new 3D landmark with the observation from previous KF
-            Matrix4d Tfw = ( prev_kf->T_kf_w );
-            Vector3d P3d = Tfw.block(0,0,3,3) * prev_frame->stereo_pt[i1]->P + Tfw.col(3).head(3);
-            //Vector3d dir = kf0->stereo_frame->stereo_pt[lr_qdx]->P / kf0->stereo_frame->stereo_pt[lr_qdx]->P.norm();
-            Vector3d dir = P3d.normalized();
-            MapPoint* map_point = new MapPoint(max_pt_idx,
-                                               P3d,
-                                               prev_frame->pdesc_l.row(i1),
-                                               kf1_idx,
-                                               prev_frame->stereo_pt[i1]->pl,
-                                               dir);
-            // add new 3D landmark to kf_idx where it was first observed
-            map_points_kf_idx.at( kf1_idx ).push_back( max_pt_idx );
-            // add observation of the 3D landmark from current KF
-            P3d = curr_kf->T_kf_w.block(0,0,3,3) * curr_frame->stereo_pt[i2]->P + curr_kf->T_kf_w.col(3).head(3);
-            //dir = kf1->stereo_frame->stereo_pt[lr_tdx]->P / kf1->stereo_frame->stereo_pt[lr_tdx]->P.norm();
-            dir = P3d / P3d.norm();
-            map_point->addMapPointObservation(curr_frame->pdesc_l.row(i2),
-                                              kf2_idx,
-                                              curr_frame->stereo_pt[i2]->pl,
-                                              dir);
-            // add 3D landmark to map
-            map_points.push_back(map_point);
-            max_pt_idx++;
-            // update full graph (new feature)
-            full_graph[kf2_idx][kf1_idx]++;
-            full_graph[kf1_idx][kf2_idx]++;
-
-            // if has refine pose:
-            if (SlamConfig::hasRefinement()) {
-                PointFeature* pt = prev_frame->stereo_pt[i1];
-                pt->pl_obs = curr_frame->stereo_pt[i2]->pl;
-                pt->inlier = true;
-                matched_pt.push_back(pt);
+    // ---------------------------------------------------
+    // find matches between prev_keyframe and curr_frame
+    // ---------------------------------------------------
+    // points f2f tracking
+    int common_pt = 0;
+    if( Config::hasPoints() && !(kf1->stereo_frame->stereo_pt.size()==0) && !(kf0->stereo_frame->stereo_pt.size()==0)  )
+    {
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        Mat pdesc_l1, pdesc_l2;
+        vector<vector<DMatch>> pmatches_12, pmatches_21;
+        // 12 and 21 matches
+        pdesc_l1 = kf0->stereo_frame->pdesc_l;
+        pdesc_l2 = kf1->stereo_frame->pdesc_l;
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchPointFeatures,
+                                      kf0->stereo_frame, bfm, pdesc_l1, pdesc_l2, ref(pmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchPointFeatures,
+                                      kf0->stereo_frame, bfm, pdesc_l2, pdesc_l1, ref(pmatches_21) );
+                match_l.wait();
+                match_r.wait();
             }
-        } else { // 3D landmark exists: copy idx && add observation to map landmark
-            // copy idx
-            int lm_idx = prev_frame->stereo_pt[i1]->idx;
-            if (map_points[lm_idx] != nullptr) {
-                curr_frame->stereo_pt[i2]->idx = lm_idx;
-                // add observation of the 3D landmark from current KF
-                Vector3d p3d = curr_kf->T_kf_w.block(0,0,3,3) * curr_frame->stereo_pt[i2]->P + curr_kf->T_kf_w.col(3).head(3);
-                //Vector3d dir = kf1->stereo_frame->stereo_pt[lr_tdx]->P / kf1->stereo_frame->stereo_pt[lr_tdx]->P.norm();
-                Vector3d dir = p3d.normalized();
-                map_points[lm_idx]->addMapPointObservation(curr_frame->pdesc_l.row(i2),
-                                                           kf2_idx,
-                                                           curr_frame->stereo_pt[i2]->pl,
-                                                           dir);
-                // update full graph (previously observed feature)
-                for (int obs : map_points[lm_idx]->kf_obs_list) {
-                    if (obs != kf2_idx) {
-                        full_graph[kf2_idx][obs]++;
-                        full_graph[obs][kf2_idx]++;
+            else
+            {
+                bfm->knnMatch( pdesc_l1, pdesc_l2, pmatches_12, 2);
+                bfm->knnMatch( pdesc_l2, pdesc_l1, pmatches_21, 2);
+            }
+        }
+        else
+            bfm->knnMatch( pdesc_l1, pdesc_l2, pmatches_12, 2);
+        // sort matches by the distance between the best and second best matches
+        double nn12_dist_th = Config::maxRatio12P();
+        // resort according to the queryIdx
+        sort( pmatches_12.begin(), pmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( pmatches_21.begin(), pmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around pmatches
+        for( int i = 0; i < pmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = pmatches_12[i][0].queryIdx;
+            int lr_tdx = pmatches_12[i][0].trainIdx;
+            int rl_tdx;
+            if( Config::bestLRMatches() )
+                rl_tdx = pmatches_21[lr_tdx][0].trainIdx;
+            else
+                rl_tdx = lr_qdx;
+            // check if they are mutual best matches and the minimum distance
+            //            double dist_nn = pmatches_12[i][0].distance;
+            double dist_12 = pmatches_12[i][0].distance / pmatches_12[i][1].distance;
+            // check the f2f max disparity condition
+            //            if( lr_qdx == rl_tdx  && dist_12 > nn12_dist_th )
+            if( lr_qdx == rl_tdx  && dist_12 <= nn12_dist_th )
+            {
+                Vector3d P_ = DT.block(0,0,3,3) * kf0->stereo_frame->stereo_pt[lr_qdx]->P + DT.col(3).head(3);
+                Vector2d pl_proj = cam->projection( P_ );
+                double   error = ( pl_proj - kf1->stereo_frame->stereo_pt[lr_tdx]->pl ).norm() * sqrt(kf0->stereo_frame->stereo_pt[lr_qdx]->sigma2);
+                if( error < sqrt(7.815) )
+                    //if( error < Config::maxKFEpipP() )
+                {
+                    common_pt++;
+                    // new 3D landmark
+                    if( kf0->stereo_frame->stereo_pt[lr_qdx]->idx == -1 )
+                    {
+                        // assign indices
+                        kf0->stereo_frame->stereo_pt[lr_qdx]->idx = max_pt_idx;
+                        kf1->stereo_frame->stereo_pt[lr_tdx]->idx = max_pt_idx;
+                        // create new 3D landmark with the observation from previous KF
+                        Matrix4d Tfw = ( kf0->T_kf_w );
+                        Vector3d P3d = Tfw.block(0,0,3,3) * kf0->stereo_frame->stereo_pt[lr_qdx]->P + Tfw.col(3).head(3);
+                        //Vector3d dir = kf0->stereo_frame->stereo_pt[lr_qdx]->P / kf0->stereo_frame->stereo_pt[lr_qdx]->P.norm();
+                        Vector3d dir = P3d / P3d.norm();
+                        MapPoint* map_point = new MapPoint(max_pt_idx,P3d,kf0->stereo_frame->pdesc_l.row(lr_qdx),kf0->kf_idx,kf0->stereo_frame->stereo_pt[lr_qdx]->pl,dir);
+                        // add new 3D landmark to kf_idx where it was first observed
+                        map_points_kf_idx.at( kf0->kf_idx ).push_back( max_pt_idx );
+                        // add observation of the 3D landmark from current KF
+                        P3d = kf1->T_kf_w.block(0,0,3,3) * kf1->stereo_frame->stereo_pt[lr_tdx]->P + kf1->T_kf_w.col(3).head(3);
+                        //dir = kf1->stereo_frame->stereo_pt[lr_tdx]->P / kf1->stereo_frame->stereo_pt[lr_tdx]->P.norm();
+                        dir = P3d / P3d.norm();
+                        map_point->addMapPointObservation(kf1->stereo_frame->pdesc_l.row(lr_tdx),kf1->kf_idx,kf1->stereo_frame->stereo_pt[lr_tdx]->pl,dir);
+                        // add 3D landmark to map
+                        map_points.push_back(map_point);
+                        max_pt_idx++;
+                        // update full graph (new feature)
+                        full_graph[kf1_idx][kf0_idx]++;
+                        full_graph[kf0_idx][kf1_idx]++;
+                        // if has refine pose:
+                        if( has_refinement )
+                        {
+                            PointFeature* pt = kf0->stereo_frame->stereo_pt[lr_qdx];
+                            pt->pl_obs = kf1->stereo_frame->stereo_pt[lr_tdx]->pl;
+                            pt->inlier = true;
+                            matched_pt.push_back(pt);
+                        }
+                    }
+                    // 3D landmark exists: copy idx && add observation to map landmark
+                    else
+                    {
+                        // copy idx
+                        int lm_idx = kf0->stereo_frame->stereo_pt[lr_qdx]->idx;
+                        if( map_points[lm_idx] != NULL )
+                        {
+                            kf1->stereo_frame->stereo_pt[lr_tdx]->idx = lm_idx;
+                            // add observation of the 3D landmark from current KF
+                            Vector3d p3d = kf1->T_kf_w.block(0,0,3,3) * kf1->stereo_frame->stereo_pt[lr_tdx]->P + kf1->T_kf_w.col(3).head(3);
+                            //Vector3d dir = kf1->stereo_frame->stereo_pt[lr_tdx]->P / kf1->stereo_frame->stereo_pt[lr_tdx]->P.norm();
+                            Vector3d dir = p3d / p3d.norm();
+                            map_points[lm_idx]->addMapPointObservation(kf1->stereo_frame->pdesc_l.row(lr_tdx),kf1->kf_idx,kf1->stereo_frame->stereo_pt[lr_tdx]->pl,dir);
+                            // update full graph (previously observed feature)
+                            for( vector<int>::iterator obs = map_points[lm_idx]->kf_obs_list.begin(); obs != map_points[lm_idx]->kf_obs_list.end(); obs++ )
+                            {
+                                if( (*obs) != kf1_idx )
+                                {
+                                    full_graph[kf1_idx][(*obs)]++;
+                                    full_graph[(*obs)][kf1_idx]++;
+                                }
+                            }
+                            // if has refine pose:
+                            if( has_refinement )
+                            {
+                                PointFeature* pt = kf0->stereo_frame->stereo_pt[lr_qdx];
+                                pt->pl_obs = kf1->stereo_frame->stereo_pt[lr_tdx]->pl;
+                                pt->inlier = true;
+                                matched_pt.push_back(pt);
+                            }
+                        }
                     }
                 }
-
-                // if has refine pose:
-                if (SlamConfig::hasRefinement()) {
-                    PointFeature* pt = prev_frame->stereo_pt[i1];
-                    pt->pl_obs = curr_frame->stereo_pt[i2]->pl;
-                    pt->inlier = true;
-                    matched_pt.push_back(pt);
-                }
             }
         }
     }
 
-    return matches;
-}
-
-int MapHandler::matchKF2KFLines(KeyFrame *prev_kf, KeyFrame *curr_kf) {
-
-    matched_ls.clear();
-    if (!SlamConfig::hasLines() || curr_kf->stereo_frame->stereo_ls.empty() || prev_kf->stereo_frame->stereo_ls.empty())
-        return 0;
-
-    int kf1_idx = prev_kf->kf_idx;
-    int kf2_idx = curr_kf->kf_idx;
-
-    StVO::StereoFrame* prev_frame = prev_kf->stereo_frame;
-    StVO::StereoFrame* curr_frame = curr_kf->stereo_frame;
-
-    int matches = 0;
-    vector<int> matches_12;
-
-    // small window; if it fails, run standard matching
-    if (SlamConfig::fastMatching()) {
-        std::vector<line_2d> pj_lines;
-        pj_lines.reserve(prev_frame->stereo_ls.size());
-
-        for (LineFeature* ls : prev_frame->stereo_ls) {
-            Vector3d sP_ = DT.block(0,0,3,3) * ls->sP + DT.col(3).head(3);
-            Vector2d spl_proj = cam->projection( sP_ );
-
-            Vector3d eP_ = DT.block(0,0,3,3) * ls->eP + DT.col(3).head(3);
-            Vector2d epl_proj = cam->projection( eP_ );
-
-            pj_lines.push_back(std::make_pair(std::make_pair(spl_proj(0), spl_proj(1)),
-                                              std::make_pair(epl_proj(0), epl_proj(1))));
-        }
-
-        //Fill in grid
-        list<point_2d> line_coords;
-        GridStructure grid(GRID_ROWS, GRID_COLS);
-        std::vector<std::pair<double, double>> directions(curr_frame->stereo_ls.size());
-        for (int idx = 0; idx < curr_frame->stereo_ls.size(); ++idx) {
-            LineFeature* line = curr_frame->stereo_ls[idx];
-
-            std::pair<double, double> &v = directions[idx];
-            v = std::make_pair((line->epl(0) - line->spl(0)) * curr_frame->inv_width, (line->epl(1) - line->spl(1)) * curr_frame->inv_height);
-            normalize(v);
-
-            getLineCoords(line->spl(0) * curr_frame->inv_width, line->spl(1) * curr_frame->inv_height,
-                          line->epl(0) * curr_frame->inv_width, line->epl(1) * curr_frame->inv_height, line_coords);
-            for (const point_2d &p : line_coords)
-                grid.at(p.first, p.second).push_back(idx);
-        }
-
-        GridWindow w;
-        int ws = SlamConfig::matchingF2FWs();
-        w.width = std::make_pair(ws, ws);
-        w.height = std::make_pair(ws, ws);
-
-        matches = matchGrid(pj_lines, prev_frame->ldesc_l, grid, curr_frame->ldesc_l, directions, w, matches_12);
-    }
-
-    if (curr_frame->stereo_ls.size() > SlamConfig::minLineMatches() &&
-            prev_frame->stereo_ls.size() > SlamConfig::minLineMatches() &&
-            matches < SlamConfig::minLineMatches()) {
-        matches = match(prev_frame->ldesc_l, curr_frame->ldesc_l, SlamConfig::minRatio12L(), matches_12);
-//        if (matches < SlamConfig::minLineMatches()) return 0;
-    }
-
-    for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-        const int i2 = matches_12[i1];
-        if (i2 < 0) continue;
-
-        // this shouldn't happen
-        if (prev_frame->stereo_ls[i1] == nullptr)
-            throw runtime_error("[MapHandler] NULL stereo line (prev)");
-        if (curr_frame->stereo_ls[i2] == nullptr)
-            throw runtime_error("[MapHandler] NULL stereo line (curr)");
-
-        // new 3D landmark
-        if (prev_frame->stereo_ls[i1]->idx == -1) {
-            // assign indices
-            prev_frame->stereo_ls[i1]->idx = max_ls_idx;
-            curr_frame->stereo_ls[i2]->idx = max_ls_idx;
-            // create new 3D landmark with the observation from previous KF
-            Matrix4d Tfw = ( prev_kf->T_kf_w );
-            Vector3d sP3d = Tfw.block(0,0,3,3) * prev_frame->stereo_ls[i1]->sP + Tfw.col(3).head(3);
-            Vector3d eP3d = Tfw.block(0,0,3,3) * prev_frame->stereo_ls[i1]->eP + Tfw.col(3).head(3);
-            Vector6d L3d;
-            L3d << sP3d, eP3d;
-            Vector3d mP3d = 0.5*(sP3d+eP3d);
-            mP3d = mP3d.normalized();
-            Vector4d pts;
-            pts << prev_frame->stereo_ls[i1]->spl, prev_frame->stereo_ls[i1]->epl;
-            MapLine* map_line = new MapLine(max_ls_idx,
-                                            L3d,
-                                            prev_frame->ldesc_l.row(i1),
-                                            kf1_idx,
-                                            prev_frame->stereo_ls[i1]->le,
-                                            mP3d,
-                                            pts);
-            // add new 3D landmark to kf_idx where it was first observed
-            map_lines_kf_idx.at( kf1_idx ).push_back( max_ls_idx );
-            // add observation of the 3D landmark from current KF
-            mP3d = 0.5*( curr_frame->stereo_ls[i2]->sP + curr_frame->stereo_ls[i2]->eP );
-            mP3d = curr_kf->T_kf_w.block(0,0,3,3) * mP3d + curr_kf->T_kf_w.col(3).head(3);
-            mP3d = mP3d.normalized();
-            pts << curr_frame->stereo_ls[i2]->spl, curr_frame->stereo_ls[i2]->epl;
-            map_line->addMapLineObservation(curr_frame->ldesc_l.row(i2),
-                                            kf2_idx,
-                                            curr_frame->stereo_ls[i2]->le,
-                                            mP3d,
-                                            pts);
-            // add 3D landmark to map
-            map_lines.push_back(map_line);
-            max_ls_idx++;
-            // update full graph (new feature)
-            full_graph[kf2_idx][kf1_idx]++;
-            full_graph[kf1_idx][kf2_idx]++;
-
-            // if has refine pose:
-            if (SlamConfig::hasRefinement()) {
-                LineFeature* ls = prev_frame->stereo_ls[i1];
-                ls->sdisp_obs   = curr_frame->stereo_ls[i2]->sdisp;
-                ls->edisp_obs   = curr_frame->stereo_ls[i2]->edisp;
-                ls->spl_obs     = curr_frame->stereo_ls[i2]->spl;
-                ls->epl_obs     = curr_frame->stereo_ls[i2]->epl;
-                ls->le_obs      = curr_frame->stereo_ls[i2]->le;
-                ls->inlier      = true;
-                matched_ls.push_back( ls );
+    // line segments f2f tracking
+    int common_ls = 0;
+    if( Config::hasLines() && !(kf1->stereo_frame->stereo_ls.size()==0) && !(kf0->stereo_frame->stereo_ls.size()==0)  )
+    {
+        Ptr<BinaryDescriptorMatcher> bdm = BinaryDescriptorMatcher::createBinaryDescriptorMatcher();
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        Mat ldesc_l1, ldesc_l2;
+        vector<vector<DMatch>> lmatches_12, lmatches_21;
+        // 12 and 21 matches
+        ldesc_l1 = kf0->stereo_frame->ldesc_l;
+        ldesc_l2 = kf1->stereo_frame->ldesc_l;
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, ldesc_l1, ldesc_l2, ref(lmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, ldesc_l2, ldesc_l1, ref(lmatches_21) );
+                match_l.wait();
+                match_r.wait();
             }
-        } else { // 3D landmark exists: copy idx && add observation to map landmark
-            // copy idx
-            int lm_idx = prev_frame->stereo_ls[i1]->idx;
-            if (map_lines[lm_idx] != nullptr) {
-                curr_frame->stereo_ls[i2]->idx = lm_idx;
-                // add observation of the 3D landmark from current KF
-                Vector3d mP3d = 0.5*(curr_frame->stereo_ls[i2]->sP+curr_frame->stereo_ls[i2]->eP);
-                mP3d = curr_kf->T_kf_w.block(0,0,3,3) * mP3d + curr_kf->T_kf_w.col(3).head(3);
-                mP3d = mP3d.normalized();
-                Vector4d pts;
-                pts << curr_frame->stereo_ls[i2]->spl, curr_frame->stereo_ls[i2]->epl;
-                map_lines[lm_idx]->addMapLineObservation(curr_frame->ldesc_l.row(i2),
-                                                         kf2_idx,
-                                                         curr_frame->stereo_ls[i2]->le,
-                                                         mP3d,
-                                                         pts);
-                // update full graph (previously observed feature)
-                for (int obs : map_lines[lm_idx]->kf_obs_list) {
-                    if (obs != kf2_idx) {
-                        full_graph[kf2_idx][obs]++;
-                        full_graph[obs][kf2_idx]++;
+            else
+            {
+                bfm->knnMatch( ldesc_l1, ldesc_l2, lmatches_12, 2);
+                bfm->knnMatch( ldesc_l2, ldesc_l1, lmatches_21, 2);
+            }
+        }
+        else
+            bfm->knnMatch( ldesc_l1, ldesc_l2, lmatches_12, 2);
+        // sort matches by the distance between the best and second best matches
+        double nn_dist_th, nn12_dist_th;
+        kf0->stereo_frame->lineDescriptorMAD(lmatches_12,nn_dist_th, nn12_dist_th);
+        nn12_dist_th  = nn12_dist_th * Config::descThL();
+        // resort according to the queryIdx
+        sort( lmatches_12.begin(), lmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( lmatches_21.begin(), lmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around lmatches
+        for( int i = 0; i < lmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = lmatches_12[i][0].queryIdx;
+            int lr_tdx = lmatches_12[i][0].trainIdx;
+            int rl_tdx;
+            if( Config::bestLRMatches() )
+                rl_tdx = lmatches_21[lr_tdx][0].trainIdx;
+            else
+                rl_tdx = lr_qdx;
+            // check if they are mutual best matches and the minimum distance
+            double dist_12 = lmatches_12[i][1].distance - lmatches_12[i][0].distance;
+            // this shouldn't happen
+            if( kf0->stereo_frame->stereo_ls[lr_qdx] == NULL || kf1->stereo_frame->stereo_ls[lr_tdx] == NULL )
+                continue;
+            if( lr_qdx == rl_tdx  && dist_12 > nn12_dist_th )
+            {
+                Vector3d sP_ = DT.block(0,0,3,3) * kf0->stereo_frame->stereo_ls[lr_qdx]->sP + DT.col(3).head(3);
+                Vector2d spl_proj = cam->projection( sP_ );
+                Vector3d eP_ = DT.block(0,0,3,3) * kf0->stereo_frame->stereo_ls[lr_qdx]->eP + DT.col(3).head(3);
+                Vector2d epl_proj = cam->projection( eP_ );
+                Vector3d l_obs = kf0->stereo_frame->stereo_ls[lr_qdx]->le;
+                // projection error
+                Vector2d err_ls;
+                err_ls(0) = l_obs(0) * spl_proj(0) + l_obs(1) * spl_proj(1) + l_obs(2);
+                err_ls(1) = l_obs(0) * epl_proj(0) + l_obs(1) * epl_proj(1) + l_obs(2);
+                if( err_ls.norm() *sqrt(kf0->stereo_frame->stereo_ls[lr_qdx]->sigma2) < sqrt(7.815) )
+                {
+                    common_ls++;
+                    // new 3D landmark
+                    if( kf0->stereo_frame->stereo_ls[lr_qdx]->idx == -1 )
+                    {
+                        // assign indices
+                        kf0->stereo_frame->stereo_ls[lr_qdx]->idx = max_ls_idx;
+                        kf1->stereo_frame->stereo_ls[lr_tdx]->idx = max_ls_idx;
+                        // create new 3D landmark with the observation from previous KF
+                        Matrix4d Tfw = ( kf0->T_kf_w );
+                        Vector3d sP3d = Tfw.block(0,0,3,3) * kf0->stereo_frame->stereo_ls[lr_qdx]->sP + Tfw.col(3).head(3);
+                        Vector3d eP3d = Tfw.block(0,0,3,3) * kf0->stereo_frame->stereo_ls[lr_qdx]->eP + Tfw.col(3).head(3);
+                        Vector6d L3d;
+                        L3d << sP3d, eP3d;
+                        Vector3d mP3d = 0.5*(sP3d+eP3d);
+                        mP3d = mP3d / mP3d.norm();
+                        Vector4d pts;
+                        pts << kf0->stereo_frame->stereo_ls[lr_qdx]->spl, kf0->stereo_frame->stereo_ls[lr_qdx]->epl;
+                        MapLine* map_line = new MapLine(max_ls_idx,L3d,kf0->stereo_frame->ldesc_l.row(lr_qdx),kf0->kf_idx,kf0->stereo_frame->stereo_ls[lr_qdx]->le,mP3d,pts);
+                        mP3d = 0.5*( kf1->stereo_frame->stereo_ls[lr_tdx]->sP + kf1->stereo_frame->stereo_ls[lr_tdx]->eP );
+                        mP3d = kf1->T_kf_w.block(0,0,3,3) * mP3d + kf1->T_kf_w.col(3).head(3);
+                        mP3d = mP3d / mP3d.norm();
+                        pts << kf1->stereo_frame->stereo_ls[lr_tdx]->spl, kf1->stereo_frame->stereo_ls[lr_tdx]->epl;
+                        map_line->addMapLineObservation(kf1->stereo_frame->ldesc_l.row(lr_tdx),kf1->kf_idx,kf1->stereo_frame->stereo_ls[lr_tdx]->le,mP3d,pts);
+                        // add new 3D landmark to kf_idx where it was first observed
+                        map_lines_kf_idx.at( kf0->kf_idx ).push_back( max_ls_idx );
+                        // add 3D landmark to map
+                        map_lines.push_back(map_line);
+                        max_ls_idx++;
+                        // update full graph (new feature)
+                        full_graph[kf1_idx][kf0_idx]++;
+                        full_graph[kf0_idx][kf1_idx]++;
+                        // if has refine pose:
+                        if( has_refinement )
+                        {
+                            LineFeature* ls = kf0->stereo_frame->stereo_ls[lr_qdx];
+                            ls->sdisp_obs   = kf1->stereo_frame->stereo_ls[lr_tdx]->sdisp;
+                            ls->edisp_obs   = kf1->stereo_frame->stereo_ls[lr_tdx]->edisp;
+                            ls->spl_obs     = kf1->stereo_frame->stereo_ls[lr_tdx]->spl;
+                            ls->epl_obs     = kf1->stereo_frame->stereo_ls[lr_tdx]->epl;
+                            ls->le_obs      = kf1->stereo_frame->stereo_ls[lr_tdx]->le;
+                            ls->inlier      = true;
+                            matched_ls.push_back( ls );
+                        }
+                    }
+                    // 3D landmark exists: copy idx && add observation to map landmark
+                    else
+                    {
+                        // copy idx
+                        int lm_idx = kf0->stereo_frame->stereo_ls[lr_qdx]->idx;
+                        if( map_lines[lm_idx] != NULL )
+                        {
+                            kf1->stereo_frame->stereo_ls[lr_tdx]->idx = lm_idx;
+                            // add observation of the 3D landmark from current KF
+                            Vector3d mP3d = 0.5*(kf1->stereo_frame->stereo_ls[lr_tdx]->sP+kf1->stereo_frame->stereo_ls[lr_tdx]->eP);
+                            mP3d = kf1->T_kf_w.block(0,0,3,3) * mP3d + kf1->T_kf_w.col(3).head(3);
+                            mP3d = mP3d / mP3d.norm();
+                            Vector4d pts;
+                            pts << kf1->stereo_frame->stereo_ls[lr_tdx]->spl, kf1->stereo_frame->stereo_ls[lr_tdx]->epl;
+                            map_lines[lm_idx]->addMapLineObservation(kf1->stereo_frame->ldesc_l.row(lr_tdx),kf1->kf_idx,kf1->stereo_frame->stereo_ls[lr_tdx]->le,mP3d,pts);
+                            // update full graph (previously observed feature)
+                            for( vector<int>::iterator obs = map_lines[lm_idx]->kf_obs_list.begin(); obs != map_lines[lm_idx]->kf_obs_list.end(); obs++ )
+                            {
+                                if( (*obs) != kf1_idx )
+                                {
+                                    full_graph[kf1_idx][(*obs)]++;
+                                    full_graph[(*obs)][kf1_idx]++;
+                                }
+                            }
+                            // if has refine pose:
+                            if( has_refinement )
+                            {
+                                LineFeature* ls = kf0->stereo_frame->stereo_ls[lr_qdx];
+                                ls->sdisp_obs   = kf1->stereo_frame->stereo_ls[lr_tdx]->sdisp;
+                                ls->edisp_obs   = kf1->stereo_frame->stereo_ls[lr_tdx]->edisp;
+                                ls->spl_obs     = kf1->stereo_frame->stereo_ls[lr_tdx]->spl;
+                                ls->epl_obs     = kf1->stereo_frame->stereo_ls[lr_tdx]->epl;
+                                ls->le_obs      = kf1->stereo_frame->stereo_ls[lr_tdx]->le;
+                                ls->inlier      = true;
+                                matched_ls.push_back( ls );
+                            }
+                        }
                     }
                 }
-
-                // if has refine pose:
-                if (SlamConfig::hasRefinement()) {
-                    LineFeature* ls = prev_frame->stereo_ls[i1];
-                    ls->sdisp_obs   = curr_frame->stereo_ls[i2]->sdisp;
-                    ls->edisp_obs   = curr_frame->stereo_ls[i2]->edisp;
-                    ls->spl_obs     = curr_frame->stereo_ls[i2]->spl;
-                    ls->epl_obs     = curr_frame->stereo_ls[i2]->epl;
-                    ls->le_obs      = curr_frame->stereo_ls[i2]->le;
-                    ls->inlier      = true;
-                    matched_ls.push_back( ls );
-                }
             }
         }
     }
 
-    return matches;
-}
+    // ---------------------------------------------------
+    // refine pose between kf0 and kf1
+    // ---------------------------------------------------
+    if( has_refinement )
+    {
+        StVO::StereoFrameHandler* stf = new StereoFrameHandler( cam );
+        stf->matched_pt = matched_pt;
+        stf->matched_ls = matched_ls;
+        stf->prev_frame = kf0->stereo_frame;
+        stf->curr_frame = kf1->stereo_frame;
+        stf->optimizePose( DT );
+        Matrix4d DT_         = stf->curr_frame->DT;
+        Vector6d Dt_cov_eig_ = stf->curr_frame->DT_cov_eig;
+        if( Dt_cov_eig_(0) <= 0.01 )
+            kf1->T_kf_w = kf0->T_kf_w * inverse_se3( DT_ );
+    }
 
-int MapHandler::matchMap2KFPoints() {
-
-    int kf2_idx = curr_kf->kf_idx;
-    StVO::StereoFrame* curr_frame = curr_kf->stereo_frame;
-
+    // ---------------------------------------------------
+    // find point matches between local map and curr_frame
+    // ---------------------------------------------------
     // select local map
     vector<MapPoint*> map_local_points;
-    std::vector<point_2d> pj_points;
     Mat map_lpt_desc;
-
-    if (!SlamConfig::hasPoints() || curr_frame->stereo_pt.empty())
-        return 0;
-
-    for (MapPoint* pt : map_points) {
-        // if it is local and not found in the current KF
-        if (pt != nullptr && pt->local && pt->kf_obs_list.back() != kf2_idx) {
-            // if the LM is projected inside the current image
-            Vector3d Pf = Twf.block(0,0,3,3) * pt->point3D + Twf.col(3).head(3);
-            Vector2d pf = cam->projection(Pf);
-            if (pf(0) > 0 && pf(0) < cam->getWidth() && pf(1) > 0 && pf(1) < cam->getHeight() && Pf(2) > 0.0) {
-                // add the point and its representative descriptor
-                map_local_points.push_back(pt);
-                pj_points.push_back(std::make_pair(pf(0) * curr_frame->inv_width, pf(1) * curr_frame->inv_height));
-                map_lpt_desc.push_back(pt->med_desc.row(0));
+    for( vector<MapPoint*>::iterator pt_it = map_points.begin(); pt_it != map_points.end(); pt_it++ )
+    {
+        if((*pt_it)!=NULL)
+        {
+            // if it is local and not found in the current KF
+            if( (*pt_it)->local && (*pt_it)->kf_obs_list.back() != kf1_idx )
+            {
+                // if the LM is projected inside the current image
+                Vector3d Pf  = Twf.block(0,0,3,3) * (*pt_it)->point3D + Twf.col(3).head(3);
+                Vector2d pf   = cam->projection( Pf );
+                if( pf(0) > 0 && pf(0) < cam->getWidth() && pf(1) > 0 && pf(1) < cam->getHeight() && Pf(2) > 0.0 )
+                {
+                    // add the point and its representative descriptor
+                    map_local_points.push_back( (*pt_it) );
+                    map_lpt_desc.push_back( (*pt_it)->med_desc.row(0) );
+                }
             }
         }
     }
@@ -560,104 +535,126 @@ int MapHandler::matchMap2KFPoints() {
     // select unmatched points
     vector<PointFeature*> unmatched_points;
     Mat unmatched_pt_desc;
-    for( int idx = 0; idx < curr_kf->stereo_frame->stereo_pt.size(); ++idx) {
-        PointFeature* pt = curr_kf->stereo_frame->stereo_pt[idx];
-        if (pt != nullptr && pt->idx == -1) {
-            unmatched_points.push_back(pt);
-            unmatched_pt_desc.push_back(curr_kf->stereo_frame->pdesc_l.row(idx));
+    int it = 0;
+    for( vector<PointFeature*>::iterator pt_it = kf1->stereo_frame->stereo_pt.begin(); pt_it != kf1->stereo_frame->stereo_pt.end(); pt_it++, it++ )
+    {
+        if( (*pt_it)->idx == -1 )
+        {
+            unmatched_points.push_back( (*pt_it) );
+            unmatched_pt_desc.push_back( kf1->stereo_frame->pdesc_l.row(it) );
         }
     }
 
-    if (map_local_points.empty() || unmatched_points.empty())
-        return 0;
-
-    int matches = 0;
-    vector<int> matches_12;
-
-    // track points from local map (small window; if it fails, run standard matching)
-    if (SlamConfig::fastMatching()) {
-        //Fill in grid
-        GridStructure grid(GRID_ROWS, GRID_COLS);
-        for (int idx = 0; idx < unmatched_points.size(); ++idx) {
-            PointFeature* point = unmatched_points[idx];
-            grid.at(point->pl(0) * curr_frame->inv_width, point->pl(1) * curr_frame->inv_height).push_back(idx);
+    // track points from local map
+    if( Config::hasPoints() && !(unmatched_points.size()==0) && !(map_local_points.size()==0)  )
+    {
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        vector<vector<DMatch>> pmatches_12, pmatches_21;
+        // 12 and 21 matches
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchPointFeatures, kf0->stereo_frame, bfm, map_lpt_desc, unmatched_pt_desc, ref(pmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchPointFeatures, kf0->stereo_frame, bfm, unmatched_pt_desc, map_lpt_desc, ref(pmatches_21) );
+                match_l.wait();
+                match_r.wait();
+            }
+            else
+            {
+                bfm->knnMatch( map_lpt_desc, unmatched_pt_desc, pmatches_12, 2);
+                bfm->knnMatch( unmatched_pt_desc, map_lpt_desc, pmatches_21, 2);
+            }
         }
-
-        GridWindow w;
-        int ws = SlamConfig::matchingF2FWs();
-        w.width = std::make_pair(ws, ws);
-        w.height = std::make_pair(ws, ws);
-
-        matches = matchGrid(pj_points, map_lpt_desc, grid, unmatched_pt_desc, w, matches_12);
-    }
-
-    if (pj_points.size() > SlamConfig::minPointMatches() &&
-            map_local_points.size() > SlamConfig::minPointMatches() &&
-            matches < SlamConfig::minPointMatches()) {
-        matches = match(map_lpt_desc, unmatched_pt_desc, SlamConfig::minRatio12P(), matches_12);
-//        if (matches < SlamConfig::minPointMatches()) return 0;
-    }
-
-    for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-        const int i2 = matches_12[i1];
-        if (i2 < 0) continue;
-
-        Vector3d Pf_map = Twf.block(0,0,3,3) * map_local_points[i1]->point3D + Twf.col(3).head(3);
-        Vector3d Pf_kf  = unmatched_points[i2]->P;
-        // check that the viewing direction condition is also satisfied
-        Vector3d dir_kf  = Pf_kf.normalized();
-        // check that the epipolar constraint is satisfied
-        Vector2d pf_map = cam->projection( Pf_map );
-        Vector2d pf_kf  = unmatched_points[i2]->pl;
-        double error_epip = ( pf_map - pf_kf ).norm();
-        if (error_epip < SlamConfig::maxKFEpipP()) {
-            // copy idx
-            int lm_idx = map_local_points[i1]->idx;
-            unmatched_points[i2]->idx = lm_idx;
-            // add observation of the 3D LM from current KF
-            dir_kf = curr_kf->T_kf_w.block(0,0,3,3) * dir_kf + curr_kf->T_kf_w.col(3).head(3);
-            map_points[lm_idx]->addMapPointObservation( unmatched_pt_desc.row(i2), kf2_idx, unmatched_points[i2]->pl, dir_kf );
-            // update full graph (previously observed feature)
-            for (int obs : map_points[lm_idx]->kf_obs_list) {
-                if (obs != kf2_idx) {
-                    full_graph[kf2_idx][obs]++;
-                    full_graph[obs][kf2_idx]++;
+        else
+            bfm->knnMatch( map_lpt_desc, unmatched_pt_desc, pmatches_12, 2);
+        // sort matches by the distance between the best and second best matches
+        double nn12_dist_th = Config::maxRatio12P();
+        // resort according to the queryIdx
+        sort( pmatches_12.begin(), pmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( pmatches_21.begin(), pmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around pmatches
+        for( int i = 0; i < pmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = pmatches_12[i][0].queryIdx;
+            int lr_tdx = pmatches_12[i][0].trainIdx;
+            int rl_tdx;
+            if( Config::bestLRMatches() )
+                rl_tdx = pmatches_21[lr_tdx][0].trainIdx;
+            else
+                rl_tdx = lr_qdx;
+            // check if they are mutual best matches and the minimum distance
+            double dist_12 = pmatches_12[i][0].distance / pmatches_12[i][1].distance;
+            //            double nn12_dist_th = Config::minRatio12P();
+            // check the f2f 12 distance condition
+            //            if( lr_qdx == rl_tdx  && dist_12 > nn12_dist_th )
+            if( lr_qdx == rl_tdx  && dist_12 <= nn12_dist_th )
+            {
+                Vector3d Pf_map = Twf.block(0,0,3,3) * map_local_points[lr_qdx]->point3D + Twf.col(3).head(3);
+                Vector3d Pf_kf  = unmatched_points[lr_tdx]->P;
+                // check that the point is projected in front of the camera
+                if( Pf_map(2) > 0.0 )
+                {
+                    // check that the viewing direction condition is also satisfied
+                    Vector3d dir_map = Twf.block(0,0,3,3) * map_local_points[lr_qdx]->med_obs_dir + Twf.col(3).head(3);
+                    Vector3d dir_kf  = Pf_kf  / Pf_kf.norm();
+                    // check that the epipolar constraint is satisfied
+                    Vector2d pf_map = cam->projection( Pf_map );
+                    Vector2d pf_kf  = unmatched_points[lr_tdx]->pl;
+                    double error_epip = ( pf_map - pf_kf ).norm();
+                    if( error_epip < Config::maxKFEpipP() )
+                    {
+                        common_pt++;
+                        // copy idx
+                        int lm_idx = map_local_points[lr_qdx]->idx;
+                        unmatched_points[lr_tdx]->idx = lm_idx;
+                        // add observation of the 3D LM from current KF
+                        dir_kf = kf1->T_kf_w.block(0,0,3,3) * dir_kf + kf1->T_kf_w.col(3).head(3);
+                        map_points[lm_idx]->addMapPointObservation( unmatched_pt_desc.row(lr_tdx), kf1_idx, unmatched_points[lr_tdx]->pl, dir_kf );
+                        // update full graph (previously observed feature)
+                        for( vector<int>::iterator obs = map_points[lm_idx]->kf_obs_list.begin(); obs != map_points[lm_idx]->kf_obs_list.end(); obs++ )
+                        {
+                            if( (*obs) != kf1_idx )
+                            {
+                                full_graph[kf1_idx][(*obs)]++;
+                                full_graph[(*obs)][kf1_idx]++;
+                            }
+                        }
+                    }
                 }
             }
         }
-        else --matches;
     }
 
-    return matches;
-}
-
-int MapHandler::matchMap2KFLines() {
-
-    int kf2_idx = curr_kf->kf_idx;
-    StVO::StereoFrame* curr_frame = curr_kf->stereo_frame;
-
+    // ---------------------------------------------------
+    // find line matches between local map and curr_frame
+    // ---------------------------------------------------
     // select local map
     vector<MapLine*> map_local_lines;
-    std::vector<line_2d> pj_lines;
     Mat map_lls_desc;
-
-    if (!SlamConfig::hasLines() || curr_frame->stereo_ls.empty())
-        return 0;
-
-    for (MapLine* ls : map_lines) {
-        if (ls != nullptr && ls->local && ls->kf_obs_list.back() != kf2_idx) {
-            // if the LM is projected inside the current image
-            Vector3d sPf = Twf.block(0,0,3,3) * ls->line3D.head(3) + Twf.col(3).head(3);
-            Vector2d spf = cam->projection( sPf );
-            Vector3d ePf = Twf.block(0,0,3,3) * ls->line3D.tail(3) + Twf.col(3).head(3);
-            Vector2d epf = cam->projection( ePf );
-            if (spf(0) > 0 && spf(0) < cam->getWidth() && spf(1) > 0 && spf(1) < cam->getHeight() && sPf(2) > 0.0 &&
-                    epf(0) > 0 && epf(0) < cam->getWidth() && epf(1) > 0 && epf(1) < cam->getHeight() && ePf(2) > 0.0) {
-                // add the point and its representative descriptor
-                map_local_lines.push_back( ls );
-                pj_lines.push_back(std::make_pair(std::make_pair(spf(0) * curr_frame->inv_width, spf(1) * curr_frame->inv_height),
-                                                  std::make_pair(epf(0) * curr_frame->inv_width, epf(1) * curr_frame->inv_height)));
-                map_lls_desc.push_back( ls->med_desc.row(0) );
+    for( vector<MapLine*>::iterator ls_it = map_lines.begin(); ls_it != map_lines.end(); ls_it++ )
+    {
+        if((*ls_it)!=NULL)
+        {
+            // if it is local and not found in the current KF
+            if( (*ls_it)->local && (*ls_it)->kf_obs_list.back() != kf1_idx )
+            {
+                // if the LM is projected inside the current image
+                Vector3d sPf  = Twf.block(0,0,3,3) * (*ls_it)->line3D.head(3) + Twf.col(3).head(3);
+                Vector2d spf   = cam->projection( sPf );
+                Vector3d ePf  = Twf.block(0,0,3,3) * (*ls_it)->line3D.tail(3) + Twf.col(3).head(3);
+                Vector2d epf   = cam->projection( ePf );
+                if( spf(0) > 0 && spf(0) < cam->getWidth() && spf(1) > 0 && spf(1) < cam->getHeight() && sPf(2) > 0.0 )
+                {
+                    if( epf(0) > 0 && epf(0) < cam->getWidth() && epf(1) > 0 && epf(1) < cam->getHeight() && ePf(2) > 0.0 )
+                    {
+                        // add the point and its representative descriptor
+                        map_local_lines.push_back( (*ls_it) );
+                        map_lls_desc.push_back( (*ls_it)->med_desc.row(0) );
+                    }
+                }
             }
         }
     }
@@ -665,159 +662,113 @@ int MapHandler::matchMap2KFLines() {
     // select unmatched line segments
     vector<LineFeature*> unmatched_lines;
     Mat unmatched_ls_desc;
-    for( int idx = 0; idx < curr_frame->stereo_ls.size(); ++idx) {
-        LineFeature *ls = curr_frame->stereo_ls[idx];
-        if (ls != nullptr && ls->idx == -1) {
-            unmatched_lines.push_back( ls );
-            unmatched_ls_desc.push_back( curr_frame->ldesc_l.row(idx) );
+    it = 0;
+    for( vector<LineFeature*>::iterator ls_it = kf1->stereo_frame->stereo_ls.begin(); ls_it != kf1->stereo_frame->stereo_ls.end(); ls_it++, it++ )
+    {
+        if( (*ls_it)->idx == -1 )
+        {
+            unmatched_lines.push_back( (*ls_it) );
+            unmatched_ls_desc.push_back( kf1->stereo_frame->ldesc_l.row(it) );
         }
     }
 
-    if (map_local_lines.empty() || unmatched_lines.empty())
-        return 0;
-
-    int matches = 0;
-    vector<int> matches_12;
-
-    // track lines from local map (small window; if it fails, run standard matching)
-    if (SlamConfig::fastMatching()) {
-        //Fill in grid
-        list<point_2d> line_coords;
-        GridStructure grid(GRID_ROWS, GRID_COLS);
-        std::vector<std::pair<double, double>> directions(unmatched_lines.size());
-        for (int idx = 0; idx < unmatched_lines.size(); ++idx) {
-            LineFeature* line = unmatched_lines[idx];
-
-            std::pair<double, double> &v = directions[idx];
-            v = std::make_pair((line->epl(0) - line->spl(0)) * curr_frame->inv_width, (line->epl(1) - line->spl(1)) * curr_frame->inv_height);
-            normalize(v);
-
-            getLineCoords(line->spl(0) * curr_frame->inv_width, line->spl(1) * curr_frame->inv_height,
-                          line->epl(0) * curr_frame->inv_width, line->epl(1) * curr_frame->inv_height, line_coords);
-            for (const point_2d &p : line_coords)
-                grid.at(p.first, p.second).push_back(idx);
+    // track line segments from local map
+    if( Config::hasLines() && !(unmatched_lines.size()==0) && !(map_local_lines.size()==0)  )
+    {
+        Ptr<BinaryDescriptorMatcher> bdm = BinaryDescriptorMatcher::createBinaryDescriptorMatcher();
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        vector<vector<DMatch>> lmatches_12, lmatches_21;
+        // 12 and 21 matches
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, map_lls_desc, unmatched_ls_desc, ref(lmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, unmatched_ls_desc, map_lls_desc, ref(lmatches_21) );
+                match_l.wait();
+                match_r.wait();
+            }
+            else
+            {
+                bfm->knnMatch( map_lls_desc, unmatched_ls_desc, lmatches_12, 2);
+                bfm->knnMatch( unmatched_ls_desc, map_lls_desc, lmatches_21, 2);
+            }
         }
+        else
+            bfm->knnMatch( map_lls_desc, unmatched_ls_desc, lmatches_12, 2);
 
-        GridWindow w;
-        int ws = SlamConfig::matchingF2FWs();
-        w.width = std::make_pair(ws, ws);
-        w.height = std::make_pair(ws, ws);
-
-        matches = matchGrid(pj_lines, map_lls_desc, grid, unmatched_ls_desc, directions, w, matches_12);
-    }
-
-    if (pj_lines.size() > SlamConfig::minLineMatches() &&
-            map_local_lines.size() > SlamConfig::minLineMatches() &&
-            matches < SlamConfig::minLineMatches()) {
-        matches = match(map_lls_desc, unmatched_ls_desc, SlamConfig::minRatio12L(), matches_12);
-//        if (matches < SlamConfig::minLineMatches()) return 0;
-    }
-
-    for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-        const int i2 = matches_12[i1];
-        if (i2 < 0) continue;
-
-        Vector3d sP_ = Twf.block(0,0,3,3) * map_local_lines[i1]->line3D.head(3) + Twf.col(3).head(3);
-        Vector2d spl_proj = cam->projection( sP_ );
-        Vector3d eP_ = Twf.block(0,0,3,3) * map_local_lines[i1]->line3D.tail(3) + Twf.col(3).head(3);
-        Vector2d epl_proj = cam->projection( eP_ );
-        Vector3d l_obs = unmatched_lines[i2]->le;
-        // check the epipolar constraint
-        Vector2d err_ls;
-        err_ls(0) = l_obs(0) * spl_proj(0) + l_obs(1) * spl_proj(1) + l_obs(2);
-        err_ls(1) = l_obs(0) * epl_proj(0) + l_obs(1) * epl_proj(1) + l_obs(2);
-        if( err_ls(0) < SlamConfig::maxKFEpipL() && err_ls(1) < SlamConfig::maxKFEpipL() ) {
-            // copy idx
-            int lm_idx = map_local_lines[i1]->idx;
-            unmatched_lines[i2]->idx = lm_idx;
-            // add observation of the 3D landmark from current KF
-            Vector3d mP3d = 0.5*(unmatched_lines[i2]->sP + unmatched_lines[i2]->eP);
-            mP3d = curr_kf->T_kf_w.block(0,0,3,3) * mP3d + curr_kf->T_kf_w.col(3).head(3);
-            mP3d = mP3d.normalized();
-            Vector4d pts;
-            pts << unmatched_lines[i2]->spl, unmatched_lines[i2]->epl;
-            map_lines[lm_idx]->addMapLineObservation( unmatched_ls_desc.row(i2), kf2_idx, unmatched_lines[i2]->le, mP3d, pts );
-            // update full graph (previously observed feature)
-            for (int obs : map_lines[lm_idx]->kf_obs_list) {
-                if (obs != kf2_idx) {
-                    full_graph[kf2_idx][obs]++;
-                    full_graph[obs][kf2_idx]++;
+        // sort matches by the distance between the best and second best matches
+        double nn_dist_th, nn12_dist_th;
+        kf0->stereo_frame->lineDescriptorMAD(lmatches_12,nn_dist_th, nn12_dist_th);
+        nn12_dist_th  = nn12_dist_th * Config::descThL();
+        // resort according to the queryIdx
+        sort( lmatches_12.begin(), lmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( lmatches_21.begin(), lmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around lmatches
+        for( int i = 0; i < lmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = lmatches_12[i][0].queryIdx;
+            int lr_tdx = lmatches_12[i][0].trainIdx;
+            if( lr_qdx != -1 && lr_tdx != -1 )
+            {
+                int rl_tdx;
+                if( Config::bestLRMatches() )
+                    rl_tdx = lmatches_21[lr_tdx][0].trainIdx;
+                else
+                    rl_tdx = lr_qdx;
+                // check if they are mutual best matches and the minimum distance
+                double dist_12 = lmatches_12[i][1].distance - lmatches_12[i][0].distance;
+                if( lr_qdx == rl_tdx && dist_12 > nn12_dist_th )
+                {
+                    Vector3d sP_ = Twf.block(0,0,3,3) * map_local_lines[lr_qdx]->line3D.head(3) + Twf.col(3).head(3);
+                    Vector2d spl_proj = cam->projection( sP_ );
+                    Vector3d eP_ = Twf.block(0,0,3,3) * map_local_lines[lr_qdx]->line3D.tail(3) + Twf.col(3).head(3);
+                    Vector2d epl_proj = cam->projection( eP_ );
+                    Vector3d l_obs = unmatched_lines[lr_tdx]->le;
+                    if( sP_(2) > 0.0 && eP_(2) > 0.0 )
+                    {
+                        // check that the features have been observed from a similar point of view
+                        Vector3d mP_ = 0.5 * ( sP_ + eP_ );
+                        Vector3d dir_map = cam->projectionNH( mP_ );
+                        dir_map = Twf.block(0,0,3,3) * map_local_lines[lr_qdx]->med_obs_dir + Twf.col(3).head(3);
+                        mP_  = 0.5 * ( unmatched_lines[lr_tdx]->sP + unmatched_lines[lr_tdx]->eP  );
+                        Vector3d dir_kf;
+                        dir_kf = mP_ / mP_.norm();
+                        // check the epipolar constraint
+                        Vector2d err_ls;
+                        err_ls(0) = l_obs(0) * spl_proj(0) + l_obs(1) * spl_proj(1) + l_obs(2);
+                        err_ls(1) = l_obs(0) * epl_proj(0) + l_obs(1) * epl_proj(1) + l_obs(2);
+                        if( err_ls(0) < Config::maxKFEpipL() && err_ls(1) < Config::maxKFEpipL() )
+                        {
+                            common_ls++;
+                            // copy idx
+                            int lm_idx = map_local_lines[lr_qdx]->idx;
+                            unmatched_lines[lr_tdx]->idx = lm_idx;
+                            // add observation of the 3D landmark from current KF
+                            Vector3d mP3d = 0.5*(unmatched_lines[lr_tdx]->sP+unmatched_lines[lr_tdx]->eP);
+                            mP3d = kf1->T_kf_w.block(0,0,3,3) * mP3d + kf1->T_kf_w.col(3).head(3);
+                            mP3d = mP3d / mP3d.norm();
+                            Vector4d pts;
+                            pts << unmatched_lines[lr_tdx]->spl, unmatched_lines[lr_tdx]->epl;
+                            map_lines[lm_idx]->addMapLineObservation( kf1->stereo_frame->ldesc_l.row(lr_tdx), kf1_idx, unmatched_lines[lr_tdx]->le, mP3d, pts );
+                            // update full graph (previously observed feature)
+                            for( vector<int>::iterator obs = map_lines[lm_idx]->kf_obs_list.begin(); obs != map_lines[lm_idx]->kf_obs_list.end(); obs++ )
+                            {
+                                if( (*obs) != kf1_idx )
+                                {
+                                    full_graph[kf1_idx][(*obs)]++;
+                                    full_graph[(*obs)][kf1_idx]++;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        else --matches;
     }
 
-    return matches;
-}
-
-void MapHandler::lookForCommonMatches( KeyFrame* kf0, KeyFrame* &kf1 )
-{
-    // ---------------------------------------------------
-    // find matches between prev_keyframe and curr_frame
-    // ---------------------------------------------------
-    // points f2f tracking
-    int common_pt = matchKF2KFPoints(prev_kf, curr_kf);
-
-    // line segments f2f tracking
-    int common_ls = matchKF2KFLines(prev_kf, curr_kf);
-
-    // ---------------------------------------------------
-    // refine pose between kf0 and kf1
-    // ---------------------------------------------------
-    if (SlamConfig::hasRefinement()) {
-        StVO::StereoFrameHandler* stf = new StereoFrameHandler( cam );
-        stf->matched_pt = matched_pt;
-        stf->matched_ls = matched_ls;
-
-        stf->prev_frame = kf0->stereo_frame;
-        stf->curr_frame = kf1->stereo_frame;
-
-        stf->n_inliers_pt = stf->matched_pt.size();
-        stf->n_inliers_ls = stf->matched_ls.size();
-        stf->n_inliers    = stf->n_inliers_pt + stf->n_inliers_ls;
-
-        stf->optimizePose();
-
-        double inl_ratio_pt = 100.0 * stf->n_inliers_pt / matched_pt.size();
-        double inl_ratio_ls = 100.0 * stf->n_inliers_ls / matched_ls.size();
-
-        bool condition_pt = true, condition_ls = true;
-        if (SlamConfig::hasPoints())
-            condition_pt = (inl_ratio_pt >= SlamConfig::kfInlierRatio());
-        if (SlamConfig::hasLines())
-            condition_ls = (inl_ratio_ls >= SlamConfig::kfInlierRatio());
-        if (!SlamConfig::hasPoints() && !SlamConfig::hasLines()) {
-            condition_pt = false;
-            condition_ls = false;
-        }
-
-        bool inl_ratio_condition = (condition_pt && condition_ls);
-
-        if (stf->n_inliers > SlamConfig::minFeatures() && inl_ratio_condition) {
-            Matrix4d DT_ = stf->curr_frame->DT;
-            kf1->T_kf_w = expmap_se3(logmap_se3( kf0->T_kf_w * DT_ ));
-        } else
-            kf1->T_kf_w = expmap_se3(logmap_se3( kf0->T_kf_w * inverse_se3(DT) ));
-
-        // update DT & Twf
-        Twf = expmap_se3(logmap_se3(  inverse_se3( curr_kf->T_kf_w ) ));
-        DT = expmap_se3(logmap_se3( Twf * prev_kf->T_kf_w ));
-
-        delete stf;
-    }
-
-    // ---------------------------------------------------
-    // find point matches between local map and curr_frame
-    // ---------------------------------------------------
-    if (SlamConfig::hasPoints())
-        common_pt += matchMap2KFPoints();
-
-    // ---------------------------------------------------
-    // find line matches between local map and curr_frame
-    // ---------------------------------------------------
-    if (SlamConfig::hasLines())
-        common_ls += matchMap2KFLines();
 }
 
 void MapHandler::expandGraphs()
@@ -826,7 +777,9 @@ void MapHandler::expandGraphs()
     // full graph
     full_graph.resize( g_size );
     for(unsigned int i = 0; i < g_size; i++ )
+    {
         full_graph[i].resize( g_size );
+    }
     // confusion matrix
     conf_matrix.resize( g_size );
     for(unsigned int i = 0; i < g_size; i++ )
@@ -835,8 +788,6 @@ void MapHandler::expandGraphs()
 
 void MapHandler::formLocalMap()
 {
-
-    // for the Single Thread version
 
     // reset local KFs & LMs
     for( vector<KeyFrame*>::iterator kf_it = map_keyframes.begin(); kf_it != map_keyframes.end(); kf_it++ )
@@ -857,7 +808,8 @@ void MapHandler::formLocalMap()
 
     // set first KF and their associated LMs as local
     map_keyframes.back()->local = true;
-    for( vector<PointFeature*>::iterator pt_it = map_keyframes.back()->stereo_frame->stereo_pt.begin(); pt_it != map_keyframes.back()->stereo_frame->stereo_pt.end(); pt_it++ )
+    for( vector<PointFeature*>::iterator pt_it = map_keyframes.back()->stereo_frame->stereo_pt.begin();
+         pt_it != map_keyframes.back()->stereo_frame->stereo_pt.end(); pt_it++ )
     {
         if( (*pt_it) != NULL )
         {
@@ -866,7 +818,8 @@ void MapHandler::formLocalMap()
                 map_points[lm_idx]->local = true;
         }
     }
-    for( vector<LineFeature*>::iterator ls_it = map_keyframes.back()->stereo_frame->stereo_ls.begin(); ls_it != map_keyframes.back()->stereo_frame->stereo_ls.end(); ls_it++ )
+    for( vector<LineFeature*>::iterator ls_it = map_keyframes.back()->stereo_frame->stereo_ls.begin();
+         ls_it != map_keyframes.back()->stereo_frame->stereo_ls.end(); ls_it++ )
     {
         if( (*ls_it) != NULL )
         {
@@ -880,17 +833,19 @@ void MapHandler::formLocalMap()
     int g_size = full_graph.size()-1;
     for( int i = 0; i < g_size; i++ )
     {
-        if( full_graph[g_size][i] >= SlamConfig::minLMCovGraph() || abs(g_size-i) <= SlamConfig::minKFLocalMap() )
+        if( full_graph[g_size][i] >= Config::minLMCovGraph() || abs(g_size-i) <= Config::minKFLocalMap() )
         {
             map_keyframes[i]->local = true;
             // loop over the landmarks seen by KF{i}
-            for( vector<PointFeature*>::iterator pt_it = map_keyframes[i]->stereo_frame->stereo_pt.begin(); pt_it != map_keyframes[i]->stereo_frame->stereo_pt.end(); pt_it++ )
+            for( vector<PointFeature*>::iterator pt_it = map_keyframes[i]->stereo_frame->stereo_pt.begin();
+                 pt_it != map_keyframes[i]->stereo_frame->stereo_pt.end(); pt_it++ )
             {
                 int lm_idx = (*pt_it)->idx;
                 if( lm_idx != -1 && map_points[lm_idx] != NULL )
                     map_points[lm_idx]->local = true;
             }
-            for( vector<LineFeature*>::iterator ls_it = map_keyframes[i]->stereo_frame->stereo_ls.begin(); ls_it != map_keyframes[i]->stereo_frame->stereo_ls.end(); ls_it++ )
+            for( vector<LineFeature*>::iterator ls_it = map_keyframes[i]->stereo_frame->stereo_ls.begin();
+                 ls_it != map_keyframes[i]->stereo_frame->stereo_ls.end(); ls_it++ )
             {
                 int lm_idx = (*ls_it)->idx;
                 if( lm_idx != -1 && map_lines[lm_idx] != NULL )
@@ -901,323 +856,256 @@ void MapHandler::formLocalMap()
 
 }
 
-void MapHandler::formLocalMap( KeyFrame * kf )
+void MapHandler::fuseLandmarksFromLocalMap()
 {
 
-    // reset local KFs & LMs
-    for( vector<KeyFrame*>::iterator kf_it = map_keyframes.begin(); kf_it != map_keyframes.end(); kf_it++ )
-    {
-        if( (*kf_it) != NULL )
-            (*kf_it)->local = false;
-    }
+    // ---------------------------------------------------
+    // find point matches between local map and local map
+    // ---------------------------------------------------
+    // select local map
+    vector<MapPoint*> map_local_points;
+    vector<int> map_local_points_idx;
+    Mat map_pps_desc;
     for( vector<MapPoint*>::iterator pt_it = map_points.begin(); pt_it != map_points.end(); pt_it++ )
     {
-        if( (*pt_it) != NULL )
-            (*pt_it)->local = false;
-    }
-    for( vector<MapLine*>::iterator  ls_it = map_lines.begin(); ls_it != map_lines.end(); ls_it++ )
-    {
-        if( (*ls_it) != NULL )
-            (*ls_it)->local = false;
-    }
-
-    // set first KF and their associated LMs as local
-    kf->local = true;
-    for( vector<PointFeature*>::iterator pt_it = kf->stereo_frame->stereo_pt.begin(); pt_it != kf->stereo_frame->stereo_pt.end(); pt_it++ )
-    {
-        if( (*pt_it) != NULL )
+        if((*pt_it)!=NULL)
         {
-            int lm_idx = (*pt_it)->idx;
-            if( lm_idx != -1 && map_points[lm_idx] != NULL )
-                map_points[lm_idx]->local = true;
-        }
-    }
-    for( vector<LineFeature*>::iterator ls_it = kf->stereo_frame->stereo_ls.begin(); ls_it != kf->stereo_frame->stereo_ls.end(); ls_it++ )
-    {
-        if( (*ls_it) != NULL )
-        {
-            int lm_idx = (*ls_it)->idx;
-            if( lm_idx != -1 && map_lines[lm_idx] != NULL )
-                map_lines[lm_idx]->local = true;
-        }
-    }
-
-    // loop over covisibility graph / full graph if we want to find more points
-    int g_size = full_graph.size()-1;
-    for( int i = 0; i < g_size; i++ )
-    {
-        if( full_graph[g_size][i] >= SlamConfig::minLMCovGraph() || abs(g_size-i) <= SlamConfig::minKFLocalMap() )
-        {
-            map_keyframes[i]->local = true;
-            // loop over the landmarks seen by KF{i}
-            for( vector<PointFeature*>::iterator pt_it = map_keyframes[i]->stereo_frame->stereo_pt.begin(); pt_it != map_keyframes[i]->stereo_frame->stereo_pt.end(); pt_it++ )
+            // if it is local and not found in the current KF
+            if( (*pt_it)->local )
             {
-                int lm_idx = (*pt_it)->idx;
-                if( lm_idx != -1 && map_points[lm_idx] != NULL )
-                    map_points[lm_idx]->local = true;
-            }
-            for( vector<LineFeature*>::iterator ls_it = map_keyframes[i]->stereo_frame->stereo_ls.begin(); ls_it != map_keyframes[i]->stereo_frame->stereo_ls.end(); ls_it++ )
-            {
-                int lm_idx = (*ls_it)->idx;
-                if( lm_idx != -1 && map_lines[lm_idx] != NULL )
-                    map_lines[lm_idx]->local = true;
+                Matrix4d Twf = map_keyframes[ (*pt_it)->kf_obs_list[0] ]->T_kf_w;
+                // if the LM is projected inside the current image
+                Vector3d Pf  = Twf.block(0,0,3,3) * (*pt_it)->point3D + Twf.col(3).head(3);
+                Vector2d pf   = cam->projection( Pf );
+
+                if( pf(0) > 0 && pf(0) < cam->getWidth() && pf(1) > 0 && pf(1) < cam->getHeight() && Pf(2) > 0.0 )
+                {
+                    // add the point and its representative descriptor
+                    map_local_points.push_back( (*pt_it) );
+                    map_pps_desc.push_back( (*pt_it)->med_desc.row(0) );
+                    map_local_points_idx.push_back( (*pt_it)->idx );
+                }
             }
         }
     }
 
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------
-// Parallelization functions
-// -----------------------------------------------------------------------------------------------------------------------------
-
-void MapHandler::addKeyFrame_multiThread(KeyFrame *curr_kf , KeyFrame *prev_kf) {
-
-    if (!threads_started) return;
-
+    // track line segments from local map
+    vector<Vector2i> map_local_points_to_fuse;
+    if( Config::hasPoints() && map_local_points.size() > 1  )
     {
-        std::lock_guard<std::mutex> lk(kf_queue_mutex);
-        kf_queue.push_back(std::make_pair(curr_kf,prev_kf));
-    }
-    new_kf.notify_one();
-}
-
-void MapHandler::handlerThread() {
-
-    if (!threads_started) return;
-
-    while (true) {
-
-        std::unique_lock<std::mutex> lk(kf_queue_mutex);
-        if (kf_queue.empty())
-            new_kf.wait(lk, [this]{return !kf_queue.empty();});
-
-        curr_kf_mt = kf_queue.front().first;
-        prev_kf_mt = kf_queue.front().second;
-        kf_queue.pop_front();
-
-        lk.unlock();
-
-        // notify threads
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        vector<vector<DMatch>> lmatches_12;
+        // 12 and 21 matches
+        bfm->knnMatch( map_pps_desc, map_pps_desc, lmatches_12, 2);
+        // bucle around lmatches
+        for( int i = 0; i < lmatches_12.size(); i++ )
         {
-            std::lock_guard<std::mutex> lk(lba_mutex);
-            lba_thread_status = LBA_ACTIVE;
-        }
-        lba_start.notify_one();
-
-        {
-            std::lock_guard<std::mutex> lk(lc_mutex);
-            lc_thread_status = LC_ACTIVE;
-        }
-        lc_start.notify_one();
-
-        if( curr_kf_mt == nullptr || prev_kf_mt == nullptr ) return;
-
-        // join localMapping and loopClosure threads
-        std::unique_lock<std::mutex> lba_lk(lba_mutex);
-        if( lba_thread_status != LBA_IDLE )
-            lba_join.wait(lba_lk, [this]{return (lba_thread_status == LBA_IDLE);});
-
-        std::unique_lock<std::mutex> lc_lk(lc_mutex);
-        if ( lc_thread_status != LC_IDLE )
-            lc_join.wait(lc_lk, [this]{return (lc_thread_status == LC_IDLE);});
-
-        // loop closure
-        if( lc_state == LC_READY )
-        {
-            loopClosureOptimizationCovGraphG2O();
-            lc_state = LC_IDLE;
-        }
-
-    }
-
-
-}
-
-void MapHandler::startThreads() {
-
-    if (threads_started) return;
-    threads_started = true;
-
-    std::thread handler(&MapHandler::handlerThread, this);
-    handler.detach();
-
-    {
-        std::lock_guard<std::mutex> lk(lba_mutex);
-        lba_thread_status = LBA_IDLE;
-    }
-    std::thread localMapping(&MapHandler::localMappingThread, this);
-    localMapping.detach();
-
-    {
-        std::lock_guard<std::mutex> lk(lc_mutex);
-        lc_thread_status = LC_IDLE;
-    }
-    std::thread loopClosure(&MapHandler::loopClosureThread, this);
-    loopClosure.detach();
-}
-
-void MapHandler::killThreads() {
-
-    if (!threads_started) return;
-    threads_started = false;
-
-    {
-        std::lock_guard<std::mutex> lk(kf_queue_mutex);
-        kf_queue.push_back(std::make_pair(nullptr,nullptr));
-    }
-    new_kf.notify_one();
-
-    print_msg("[Waiting for threads to finish...");
-
-    std::unique_lock<std::mutex> lba_lk(lba_mutex);
-    if (lba_thread_status != LBA_TERMINATED)
-        lba_join.wait(lba_lk, [this]{return (lba_thread_status == LBA_TERMINATED);});
-
-    std::unique_lock<std::mutex> lc_lk(lc_mutex);
-    if (lc_thread_status != LC_TERMINATED)
-        lc_join.wait(lc_lk, [this]{return (lc_thread_status == LC_TERMINATED);});
-}
-
-void MapHandler::localMappingThread() {
-
-    if (!threads_started) return;
-
-    std::unique_lock<std::mutex> lk(lba_mutex, std::defer_lock);
-    while (true) {
-
-        lk.lock();
-        if (lba_thread_status != LBA_ACTIVE)
-            lba_start.wait(lk, [this]{return (lba_thread_status == LBA_ACTIVE);});
-        lk.unlock();
-
-        if (curr_kf_mt == nullptr || prev_kf_mt == nullptr) break;
-
-        // reset indices
-        for (PointFeature* pt : curr_kf_mt->stereo_frame->stereo_pt)
-            pt->idx = -1;
-        for (LineFeature* ls : curr_kf_mt->stereo_frame->stereo_ls)
-            ls->idx = -1;
-
-        // look for common matches and update the full graph
-        lookForCommonMatches( prev_kf_mt, curr_kf_mt );
-
-        // form local map
-        formLocalMap(curr_kf_mt);
-
-        // perform local bundle adjustment
-        int lba = localBundleAdjustment();
-
-        // recent map LMs culling (implement filters for line segments, which seems to be unaccurate)
-        removeBadMapLandmarks();
-
-        lk.lock();
-        lba_thread_status = LBA_IDLE;
-        lk.unlock();
-
-        lba_join.notify_one();
-    }
-
-    lk.lock();
-    lba_thread_status = LBA_TERMINATED;
-    lk.unlock();
-
-    lba_join.notify_one();
-
-    print_msg("[localMappingThread] terminated.");
-}
-
-void MapHandler::loopClosureThread() {
-
-    if (!threads_started) return;
-
-    std::unique_lock<std::mutex> lk(lc_mutex, std::defer_lock);
-    while (true) {
-
-        lk.lock();
-        if (lc_thread_status != LC_ACTIVE)
-            lc_start.wait(lk, [this]{return (lc_thread_status == LC_ACTIVE);});
-        lk.unlock();
-
-        if ( curr_kf_mt == nullptr && prev_kf_mt == nullptr ) break; // stop loop closure thread
-
-        // insert BOW vector
-        if( SlamConfig::hasPoints() && SlamConfig::hasLines() )
-            insertKFBowVectorPL(curr_kf_mt);
-        else if( SlamConfig::hasPoints() && !SlamConfig::hasLines() )
-            insertKFBowVectorP(curr_kf_mt);
-        else if( !SlamConfig::hasPoints() && SlamConfig::hasLines() )
-            insertKFBowVectorL(curr_kf_mt);
-
-        // look for loop closure candidates
-        int lc_kf_idx = -1;
-        lookForLoopCandidates(curr_kf_mt->kf_idx, lc_kf_idx);
-        //bool inl_ratio_condition = false;
-        if( lc_kf_idx >= 0 )
-        {
-
-            vector<Vector4i> lc_pt_idx, lc_ls_idx;
-            vector<PointFeature*> lc_points;
-            vector<LineFeature*>  lc_lines;
-            Vector6d pose_inc;
-
-            bool isLC = isLoopClosure( map_keyframes[lc_kf_idx], curr_kf_mt, pose_inc, lc_pt_idx, lc_ls_idx, lc_points, lc_lines );
-
-            // if it is loop closure, add information and update status
-            if( isLC )
+            // check if they are mutual best matches
+            int lr_qdx = lmatches_12[i][1].queryIdx;
+            int lr_tdx = lmatches_12[i][1].trainIdx;
+            if( lr_qdx != -1 && lr_tdx != -1 && lr_qdx != lr_tdx && map_local_points[lr_qdx] != NULL && map_local_points[lr_tdx] != NULL  )
             {
-                lc_pt_idxs.push_back( lc_pt_idx );
-                lc_ls_idxs.push_back( lc_ls_idx );
-                lc_poses.push_back( pose_inc );
-                lc_pose_list.push_back( pose_inc );
-                Vector3i lc_idx;
-                lc_idx(0) = map_keyframes[lc_kf_idx]->kf_idx;
-                lc_idx(1) = curr_kf_mt->kf_idx;
-                lc_idx(2) = 1;
-                lc_idxs.push_back( lc_idx );
-                lc_idx_list.push_back(lc_idx);
-                if( lc_state == LC_IDLE )
-                    lc_state = LC_ACTIVE;
+                // compare the directions of the 3D lines
+                Vector3d P1 = map_local_points[lr_qdx]->point3D;
+                Vector3d P2 = map_local_points[lr_tdx]->point3D;
+                double Pd = (P2-P1).norm();
+                if( Pd < Config::maxPointPointError() )
+                {
+                    // add LM indices to list
+                    Vector2i idx;
+                    idx(0) = lr_qdx;
+                    idx(1) = lr_tdx;
+                    map_local_points_to_fuse.push_back(idx);
+                }
+            }
+        }
+    }
+
+    // fuse landmark list
+    int k = 0;
+    for( auto it = map_local_points_to_fuse.begin(); it != map_local_points_to_fuse.end(); it++, k++ )
+    {
+        int idx_1 = (*it)(0);
+        int idx_2 = (*it)(1);
+        if( map_local_points[idx_1]!=NULL && map_local_points[idx_2]!=NULL && idx_1 != idx_2 )
+        {
+            MapPoint* P1 = map_local_points[idx_1];
+            MapPoint* P2 = map_local_points[idx_2];
+            // update graphs
+            for( auto ldx1 = P1->kf_obs_list.begin(); ldx1 != P1->kf_obs_list.end(); ldx1++ )
+            {
+                for( auto ldx2 = P2->kf_obs_list.begin(); ldx2 != P2->kf_obs_list.end(); ldx2++ )
+                {
+                    full_graph[(*ldx1)][(*ldx2)]++;
+                    full_graph[(*ldx2)][(*ldx1)]++;
+                }
+            }
+            // add observations
+            for( int i = 0; i < P2->kf_obs_list.size(); i++ )
+                P1->addMapPointObservation( P2->desc_list[i],
+                                            P2->kf_obs_list[i],
+                                            P2->obs_list[i],
+                                            P2->dir_list[i] );
+            // remove landmark
+            map_points[ map_local_points_idx[k] ] = NULL;
+        }
+    }
+
+    // ---------------------------------------------------
+    // find line matches between local map and local map
+    // ---------------------------------------------------
+    // select local map
+    vector<MapLine*> map_local_lines;
+    vector<int> map_local_lines_idx;
+    Mat map_lls_desc;
+    for( vector<MapLine*>::iterator ls_it = map_lines.begin(); ls_it != map_lines.end(); ls_it++ )
+    {
+        if((*ls_it)!=NULL)
+        {
+            // if it is local and not found in the current KF
+            if( (*ls_it)->local )
+            {
+                Matrix4d Twf = map_keyframes[ (*ls_it)->kf_obs_list[0] ]->T_kf_w;
+                // if the LM is projected inside the current image
+                Vector3d sPf  = Twf.block(0,0,3,3) * (*ls_it)->line3D.head(3) + Twf.col(3).head(3);
+                Vector2d spf   = cam->projection( sPf );
+                Vector3d ePf  = Twf.block(0,0,3,3) * (*ls_it)->line3D.tail(3) + Twf.col(3).head(3);
+                Vector2d epf   = cam->projection( ePf );
+                if( spf(0) > 0 && spf(0) < cam->getWidth() && spf(1) > 0 && spf(1) < cam->getHeight() && sPf(2) > 0.0 )
+                {
+                    if( epf(0) > 0 && epf(0) < cam->getWidth() && epf(1) > 0 && epf(1) < cam->getHeight() && ePf(2) > 0.0 )
+                    {
+                        // add the point and its representative descriptor
+                        map_local_lines.push_back( (*ls_it) );
+                        map_lls_desc.push_back( (*ls_it)->med_desc.row(0) );
+                        map_local_lines_idx.push_back( (*ls_it)->idx );
+                    }
+                }
+            }
+        }
+    }
+
+    // track line segments from local map
+    vector<Vector2i> map_local_lines_to_fuse;
+    if( Config::hasLines() && map_local_lines.size() > 1  )
+    {
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        vector<vector<DMatch>> lmatches_12;
+        // 12 and 21 matches
+        bfm->knnMatch( map_lls_desc, map_lls_desc, lmatches_12, 2);
+        // bucle around lmatches
+        for( int i = 0; i < lmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = lmatches_12[i][1].queryIdx;
+            int lr_tdx = lmatches_12[i][1].trainIdx;
+            if( lr_qdx != -1 && lr_tdx != -1 && lr_qdx != lr_tdx && map_local_lines[lr_qdx]!=NULL && map_local_lines[lr_tdx]!=NULL )
+            {
+                /*// compare the directions of the 3D lines
+                Vector6d L1 = map_local_lines[lr_qdx]->line3D;
+                Vector6d L2 = map_local_lines[lr_tdx]->line3D;
+                Vector3d d1 = (L1.tail(3)-L1.head(3)) / (L1.tail(3)-L1.head(3)).norm() ;
+                Vector3d d2 = (L2.tail(3)-L2.head(3)) / (L2.tail(3)-L2.head(3)).norm() ;
+                double Ld = (d1-d2).norm();
+                // compute the distance of the endpoints to the first 3D line
+                vector<double> lambda1, lambda2;
+                for( int j = 0; j < 3; j++ )
+                {
+                    lambda1.push_back( (L2(j)-L1(j)) / d1(j)  );
+                    lambda1.push_back( (L2(j+3)-L1(j)) / d1(j)  );
+                    lambda2.push_back( (L1(j)-L2(j)) / d2(j)  );
+                    lambda2.push_back( (L1(j+3)-L2(j)) / d2(j)  );
+                }
+                double std1 = vector_stdv(lambda1);
+                double std2 = vector_stdv(lambda2);
+                if( Ld < Config::maxDirLineError() && std1 < Config::maxPointLineError() && std2 < Config::maxPointLineError() )*/
+
+                // compare the distance from the points to the line
+                Vector6d L1 = map_local_lines[lr_qdx]->line3D;
+                Vector6d L2 = map_local_lines[lr_tdx]->line3D;
+                Vector3d d1 = (L1.tail(3)-L1.head(3)) / (L1.tail(3)-L1.head(3)).norm() ;
+                Vector3d d2 = (L2.tail(3)-L2.head(3)) / (L2.tail(3)-L2.head(3)).norm() ;
+                double Ld = (d1-d2).norm();
+                double dP, dQ;
+                if( d1.norm() > d2.norm() ) //dist from the points in the 2nd to the 1st line
+                {
+                    Vector3d x1 = L1.head(3);
+                    Vector3d  p = L2.head(3);
+                    Vector3d  q = L2.tail(3);
+                    dP = ( (p-x1) - (p-x1).dot(d1) * d1 ).norm();
+                    dQ = ( (q-x1) - (q-x1).dot(d1) * d1 ).norm();
+                }
+                else
+                {
+                    Vector3d x2 = L2.head(3);
+                    Vector3d  p = L1.head(3);
+                    Vector3d  q = L1.tail(3);
+                    dP = ( (p-x2) - (p-x2).dot(d2) * d2 ).norm();
+                    dQ = ( (q-x2) - (q-x2).dot(d2) * d2 ).norm();
+                }
+                if( Ld < Config::maxDirLineError() && dP < Config::maxPointLineError() && dQ < Config::maxPointLineError() )
+                {
+                    // add LM indices to list
+                    Vector2i idx;
+                    idx(0) = lr_qdx;
+                    idx(1) = lr_tdx;
+                    map_local_lines_to_fuse.push_back(idx);
+                }
+            }
+        }
+    }
+
+    // fuse landmark list
+    k = 0;
+    for( auto it = map_local_lines_to_fuse.begin(); it != map_local_lines_to_fuse.end(); it++, k++ )
+    {
+        int idx_1 = (*it)(0);
+        int idx_2 = (*it)(1);
+        if( map_local_lines[idx_1]!=NULL && map_local_lines[idx_2]!=NULL && idx_1 != idx_2 )
+        {
+            // look for the biggest line
+            double d1 = ( map_local_lines[idx_1]->line3D.head(3)-map_local_lines[idx_1]->line3D.tail(3) ).norm();
+            double d2 = ( map_local_lines[idx_2]->line3D.head(3)-map_local_lines[idx_2]->line3D.tail(3) ).norm();
+            MapLine* L1;
+            MapLine* L2;
+            if( d1 > d2 )
+            {
+                L1 = map_local_lines[idx_1];
+                L2 = map_local_lines[idx_2];
             }
             else
             {
-                if( lc_state == LC_ACTIVE )
-                    lc_state = LC_READY;
+                L1 = map_local_lines[idx_2];
+                L2 = map_local_lines[idx_1];
             }
-
-            for (PointFeature* pt : lc_points)
-                delete pt;
-            for (LineFeature* ls : lc_lines)
-                delete ls;
+            // update graphs
+            for( auto ldx1 = L1->kf_obs_list.begin(); ldx1 != L1->kf_obs_list.end(); ldx1++ )
+            {
+                for( auto ldx2 = L2->kf_obs_list.begin(); ldx2 != L2->kf_obs_list.end(); ldx2++ )
+                {
+                    full_graph[(*ldx1)][(*ldx2)]++;
+                    full_graph[(*ldx2)][(*ldx1)]++;
+                }
+            }
+            // add observations
+            for( int i = 0; i < L2->kf_obs_list.size(); i++ )
+                L1->addMapLineObservation( L2->desc_list[i],
+                                           L2->kf_obs_list[i],
+                                           L2->obs_list[i],
+                                           L2->dir_list[i],
+                                           L2->pts_list[i] );
+            // remove landmark
+            map_lines[ map_local_lines_idx[k] ] = NULL;
         }
-        else
-        {
-            if( lc_state == LC_ACTIVE )
-                lc_state = LC_READY;
-        }
-
-        lk.lock();
-        lc_thread_status = LC_IDLE;
-        lk.unlock();
-
-        lc_join.notify_one();
-
     }
 
-    lk.lock();
-    lc_thread_status = LC_TERMINATED;
-    lk.unlock();
-
-    lc_join.notify_one();
-
-    print_msg("[LoopClosureThread] terminated.");
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------
 // Local Bundle Adjustment functions
 // -----------------------------------------------------------------------------------------------------------------------------
 
-int MapHandler::localBundleAdjustment()
+void MapHandler::localBundleAdjustment()
 {
 
     vector<double> X_aux;
@@ -1322,14 +1210,11 @@ int MapHandler::localBundleAdjustment()
 
     // Levenberg-Marquardt optimization of the local map
     if( pt_obs_list.size() + ls_obs_list.size() != 0 )
-        //return levMarquardtOptimizationPoseOnlyLBA(X_aux,kf_list,pt_list,ls_list,pt_obs_list,ls_obs_list);
-        return levMarquardtOptimizationLBA(X_aux,kf_list,pt_list,ls_list,pt_obs_list,ls_obs_list);
-    else
-        return -1;
+        levMarquardtOptimizationLBA(X_aux,kf_list,pt_list,ls_list,pt_obs_list,ls_obs_list);
 
 }
 
-int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> kf_list, vector<int> pt_list, vector<int> ls_list, vector<Vector6i> pt_obs_list, vector<Vector6i> ls_obs_list  )
+void MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> kf_list, vector<int> pt_list, vector<int> ls_list, vector<Vector6i> pt_obs_list, vector<Vector6i> ls_obs_list  )
 {
 
     // create Levenberg-Marquardt variables
@@ -1346,8 +1231,8 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
 
     // create Levenberg-Marquardt parameters
     double err = 0.0, err_prev = 999999999.9;
-    double lambda = SlamConfig::lambdaLbaLM(), lambda_k = SlamConfig::lambdaLbaK();
-    int    max_iters = SlamConfig::maxItersLba();
+    double lambda = Config::lambdaLbaLM(), lambda_k = Config::lambdaLbaK();
+    int    max_iters = Config::maxItersLba();
 
     // estimate H and g to precalculate lambda
     //---------------------------------------------------------------------------------------------
@@ -1380,7 +1265,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
             double gy   = Xwi(1);
             double gz   = Xwi(2);
             double gz2  = gz*gz;
-            gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2         = 1.0 / std::max(Config::homogTh(),gz2);
             double fx   = cam->getFx();
             double fy   = cam->getFy();
             double dx   = p_err(0);
@@ -1390,23 +1275,24 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
             // estimate Jacobian wrt KF pose
             Vector6d Jij_Tiw = Vector6d::Zero();
             Jij_Tiw << + gz2 * fxdx * gz,
-                       + gz2 * fydy * gz,
-                       - gz2 * ( fxdx*gx + fydy*gy ),
-                       - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
-                       + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
-                       + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
-            Jij_Tiw = Jij_Tiw / std::max(SlamConfig::homogTh(),p_err_norm);
+                    + gz2 * fydy * gz,
+                    - gz2 * ( fxdx*gx + fydy*gy ),
+                    - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
+                    + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
+                    + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
+            Jij_Tiw = Jij_Tiw / std::max(Config::homogTh(),p_err_norm);
             // estimate Jacobian wrt LM
             Vector3d Jij_Xwj = Vector3d::Zero();
             Jij_Xwj << + gz2 * fxdx * gz,
-                       + gz2 * fydy * gz,
-                       - gz2 * ( fxdx*gx + fydy*gy );
-            Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(SlamConfig::homogTh(),p_err_norm);
-            // if employing robust cost function            
+                    + gz2 * fydy * gz,
+                    - gz2 * ( fxdx*gx + fydy*gy );
+            Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(Config::homogTh(),p_err_norm);
+            // if employing robust cost function
             double w = 1.0;
-            w = robustWeightCauchy(p_err_norm) ;
-
+            double s2 = map_points[lm_idx_map]->sigma_list[lm_idx_obs];
+            w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
             // update hessian, gradient, and error
+            VectorXd g_aux = VectorXd::Zero(N);
             MatrixXd Haux  = MatrixXd::Zero(3,6);
             int idx = 6 * kf_idx_loc;
             int jdx = 6*Nkf + 3*lm_idx_loc;
@@ -1463,7 +1349,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
             double gy   = Pwi(1);
             double gz   = Pwi(2);
             double gz2  = gz*gz;
-            gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2         = 1.0 / std::max(Config::homogTh(),gz2);
             double fx   = cam->getFx();
             double fy   = cam->getFy();
             double lx   = l_err(0);
@@ -1473,49 +1359,49 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
             // - jac. wrt. KF pose
             Vector6d Jij_Piw = Vector6d::Zero();
             Jij_Piw << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy ),
-                       - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                       + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                       + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy ),
+                    - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                    + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                    + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
             // - jac. wrt. LM
             Vector3d Jij_Pwj = Vector3d::Zero();
             Jij_Pwj << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy );
-            Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(SlamConfig::homogTh(),l_err_norm);
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy );
+            Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(Config::homogTh(),l_err_norm);
             // end point
             gx   = Qwi(0);
             gy   = Qwi(1);
             gz   = Qwi(2);
             gz2  = gz*gz;
-            gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2         = 1.0 / std::max(Config::homogTh(),gz2);
             // - jac. wrt. KF pose
             Vector6d Jij_Qiw = Vector6d::Zero();
             Jij_Qiw << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy ),
-                       - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                       + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                       + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy ),
+                    - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                    + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                    + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
             // - jac. wrt. LM
             Vector3d Jij_Qwj = Vector3d::Zero();
             Jij_Qwj << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy );
-            Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(SlamConfig::homogTh(),l_err_norm);
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy );
+            Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(Config::homogTh(),l_err_norm);
             // estimate Jacobian wrt KF pose
             Vector6d Jij_Tiw = Vector6d::Zero();
-            Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(SlamConfig::homogTh(),l_err_norm);
+            Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(Config::homogTh(),l_err_norm);
             // estimate Jacobian wrt LM
             Vector6d Jij_Lwj = Vector6d::Zero();
             Jij_Lwj.head(3) = Jij_Pwj;
             Jij_Lwj.tail(3) = Jij_Qwj;
             // if employing robust cost function
-            double w  = 1.0;
-            w = robustWeightCauchy(l_err_norm) ;
-
+            double s2 = map_lines[lm_idx_map]->sigma_list[lm_idx_obs];
+            double w = 1.0 / ( 1.0 + l_err_norm * l_err_norm * s2 );
             // update hessian, gradient, and error
+            VectorXd g_aux = VectorXd::Zero(N);
             MatrixXd Haux  = MatrixXd::Zero(3,6);
             int idx = 6 * kf_idx_loc;
             int jdx = 6*Nkf + 3*Npt + 6*lm_idx_loc;
@@ -1539,23 +1425,20 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         }
     }
     err /= (Npt_obs+Nls_obs);
-
     // initial guess of lambda
-    double Hmax = 0.0;
+    int Hmax = 0.0;
     for( int i = 0; i < N; i++)
     {
         if( H(i,i) > Hmax || H(i,i) < -Hmax )
             Hmax = fabs( H(i,i) );
     }
     lambda *= Hmax;
-
     // solve the first iteration
     for(int i = 0; i < N; i++)
         H(i,i) += lambda * H(i,i) ;
     H_ = H.sparseView();
     SimplicialLDLT< SparseMatrix<double> > solver1(H_);
     DX = solver1.solve( g );
-
     // update KFs
     for( int i = 0; i < Nkf; i++)
     {
@@ -1563,13 +1446,9 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         Matrix4d Tcurr = Tprev * inverse_se3( expmap_se3( DX.block(6*i,0,6,1) ) );
         X.block(6*i,0,6,1) = logmap_se3( Tcurr );
     }
-    // update point LMs
-    for( int i = 6*Nkf; i < 6*Nkf+3*Npt; i++)
+    // update LMs
+    for( int i = 6*Nkf; i < N; i++)
         X(i) += DX(i);
-    // update line LMs
-    for( int i = 6*Nkf+3*Npt; i < N; i++)
-        X(i) += DX(i);
-
     // update error
     err_prev = err;
 
@@ -1582,7 +1461,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         DX = VectorXd::Zero(N);
         g  = VectorXd::Zero(N);
         H  = MatrixXd::Zero(N,N);
-        err = 0.0;        
+        err = 0.0;
         // - point observations
         for( vector<Vector6i>::iterator pt_it = pt_obs_list.begin(); pt_it != pt_obs_list.end(); pt_it++ )
         {
@@ -1613,7 +1492,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 double gy   = Xwi(1);
                 double gz   = Xwi(2);
                 double gz2  = gz*gz;
-                gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+                gz2         = 1.0 / std::max(Config::homogTh(),gz2);
                 double fx   = cam->getFx();
                 double fy   = cam->getFy();
                 double dx   = p_err(0);
@@ -1623,25 +1502,23 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 // estimate Jacobian wrt KF pose
                 Vector6d Jij_Tiw = Vector6d::Zero();
                 Jij_Tiw << + gz2 * fxdx * gz,
-                           + gz2 * fydy * gz,
-                           - gz2 * ( fxdx*gx + fydy*gy ),
-                           - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
-                           + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
-                           + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
-                Jij_Tiw = Jij_Tiw / std::max(SlamConfig::homogTh(),p_err_norm);
+                        + gz2 * fydy * gz,
+                        - gz2 * ( fxdx*gx + fydy*gy ),
+                        - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
+                        + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
+                        + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
+                Jij_Tiw = Jij_Tiw / std::max(Config::homogTh(),p_err_norm);
                 // estimate Jacobian wrt LM
                 Vector3d Jij_Xwj = Vector3d::Zero();
                 Jij_Xwj << + gz2 * fxdx * gz,
-                           + gz2 * fydy * gz,
-                           - gz2 * ( fxdx*gx + fydy*gy );
-                Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(SlamConfig::homogTh(),p_err_norm);
+                        + gz2 * fydy * gz,
+                        - gz2 * ( fxdx*gx + fydy*gy );
+                Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(Config::homogTh(),p_err_norm);
                 // if employing robust cost function
-                double w  = 1.0;
                 double s2 = map_points[lm_idx_map]->sigma_list[lm_idx_obs];
-                //double w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
-                w = robustWeightCauchy(p_err_norm) ;
-
+                double w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
                 // update hessian, gradient, and error
+                VectorXd g_aux = VectorXd::Zero(N);
                 MatrixXd Haux  = MatrixXd::Zero(3,6);
                 int idx = 6 * kf_idx_loc;
                 int jdx = 6*Nkf + 3*lm_idx_loc;
@@ -1675,8 +1552,8 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
             if( map_lines[lm_idx_map] != NULL && map_keyframes[kf_idx_map] != NULL)
             {
                 // grab 3D LM (Pwj and Qwj)
-                Vector3d Pwj = X.block(6*Nkf+3*Npt+3*lm_idx_loc,0,3,1);
-                Vector3d Qwj = X.block(6*Nkf+3*Npt+3*lm_idx_loc,0,3,1);
+                Vector3d Pwj   = map_lines[lm_idx_map]->line3D.head(3);
+                Vector3d Qwj   = map_lines[lm_idx_map]->line3D.tail(3);
                 // grab 6DoF KF (Tiw)
                 Matrix4d Tiw   = map_keyframes[kf_idx_map]->T_kf_w;
                 // projection error
@@ -1705,16 +1582,16 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 // - jac. wrt. KF pose
                 Vector6d Jij_Piw = Vector6d::Zero();
                 Jij_Piw << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy ),
-                           - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                           + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                           + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy ),
+                        - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                        + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                        + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
                 // - jac. wrt. LM
                 Vector3d Jij_Pwj = Vector3d::Zero();
                 Jij_Pwj << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy );
                 Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(0.0000001,l_err_norm);
                 // end point
                 gx   = Qwi(0);
@@ -1725,16 +1602,16 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 // - jac. wrt. KF pose
                 Vector6d Jij_Qiw = Vector6d::Zero();
                 Jij_Qiw << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy ),
-                           - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                           + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                           + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy ),
+                        - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                        + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                        + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
                 // - jac. wrt. LM
                 Vector3d Jij_Qwj = Vector3d::Zero();
                 Jij_Qwj << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy );
                 Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(0.0000001,l_err_norm);
                 // estimate Jacobian wrt KF pose
                 Vector6d Jij_Tiw = Vector6d::Zero();
@@ -1744,10 +1621,10 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 Jij_Lwj.head(3) = Jij_Pwj;
                 Jij_Lwj.tail(3) = Jij_Qwj;
                 // if employing robust cost function
-                double w  = 1.0;
-                w = robustWeightCauchy(l_err_norm) ;
-
+                double s2 = map_lines[lm_idx_map]->sigma_list[lm_idx_obs];
+                double w = 1.0 / ( 1.0 + l_err_norm * l_err_norm * s2 );
                 // update hessian, gradient, and error
+                VectorXd g_aux = VectorXd::Zero(N);
                 MatrixXd Haux  = MatrixXd::Zero(3,6);
                 int idx = 6 * kf_idx_loc;
                 int jdx = 6*Nkf + 3*Npt + 6*lm_idx_loc;
@@ -1772,7 +1649,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         }
         err /= (Npt+Nls);
         // if the difference is very small stop
-        if( abs(err-err_prev) < Config::minErrorChange() || err < Config::minError() )
+        if( abs(err-err_prev) < numeric_limits<double>::epsilon() || err < numeric_limits<double>::epsilon() )
             break;
         // add lambda to hessian
         for(int i = 0; i < N; i++)
@@ -1781,7 +1658,6 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         H_ = H.sparseView();
         SimplicialLDLT< SparseMatrix<double> > solver1(H_);
         DX = solver1.solve( g );
-
         // update lambda
         if( err > err_prev ){
             lambda /= lambda_k;
@@ -1796,25 +1672,18 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
                 Matrix4d Tcurr = Tprev * inverse_se3( expmap_se3( DX.block(6*i,0,6,1) ) );
                 X.block(6*i,0,6,1) = logmap_se3( Tcurr );
             }
-            // update point LMs
-            for( int i = 6*Nkf; i < 6*Nkf+3*Npt; i++)
-                X(i) += DX(i);
-            // update line LMs
-            for( int i = 6*Nkf+3*Npt; i < N; i++)
+            // update LMs
+            for( int i = 6*Nkf; i < N; i++)
                 X(i) += DX(i);
         }
         // if the parameter change is small stop
-        if( DX.norm() < Config::minErrorChange() )
+        if( DX.norm() < numeric_limits<double>::epsilon() )
             break;
         // update previous values
         err_prev = err;
 
     }
-
-    if( vo_status != VO_INSERTING_KF )
-    {
-
-    m_insert_kf.lock();
+    cout << endl << "LBA Iterations:    " << iters << endl << endl;
 
     // Update KFs and LMs
     //---------------------------------------------------------------------------------------------
@@ -1827,36 +1696,24 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
     // update point LMs
     for( int i = 0; i < Npt; i++)
     {
-
-        Vector3d DX = X.block(6*Nkf+3*i,0,3,1) - map_points[ pt_list[i] ]->point3D;
-        if( DX.norm() > 0.01 )
-            map_points[ pt_list[i] ]->inlier = false;
-
         map_points[ pt_list[i] ]->point3D(0) = X(6*Nkf+3*i);
         map_points[ pt_list[i] ]->point3D(1) = X(6*Nkf+3*i+1);
         map_points[ pt_list[i] ]->point3D(2) = X(6*Nkf+3*i+2);
-
     }
     // update line segment LMs
     for( int i = 0; i < Nls; i++)
     {
-
-        Vector6d DX = X.block(6*Nkf+3*Npt+6*i,0,6,1) - map_lines[ ls_list[i] ]->line3D;
-        if( DX.norm() > 0.01 )
-            map_lines[ ls_list[i] ]->inlier = false;
-
         map_lines[ ls_list[i] ]->line3D(0) = X(6*Nkf+3*Npt+6*i);
         map_lines[ ls_list[i] ]->line3D(1) = X(6*Nkf+3*Npt+6*i+1);
         map_lines[ ls_list[i] ]->line3D(2) = X(6*Nkf+3*Npt+6*i+2);
         map_lines[ ls_list[i] ]->line3D(3) = X(6*Nkf+3*Npt+6*i+3);
         map_lines[ ls_list[i] ]->line3D(4) = X(6*Nkf+3*Npt+6*i+4);
         map_lines[ ls_list[i] ]->line3D(5) = X(6*Nkf+3*Npt+6*i+5);
-
     }
 
     // Remove bad observations
     //---------------------------------------------------------------------------------------------
-    for( vector<Vector6i>::reverse_iterator pt_it = pt_obs_list.rbegin(); pt_it != pt_obs_list.rend(); ++pt_it )
+    for( vector<Vector6i>::iterator pt_it = pt_obs_list.end(); pt_it != pt_obs_list.begin(); pt_it-- )
     {
         if( (*pt_it)(5) == -1 )
         {
@@ -1916,7 +1773,7 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
         }
     }
 
-    for( vector<Vector6i>::reverse_iterator ls_it = ls_obs_list.rbegin(); ls_it != ls_obs_list.rend(); ++ls_it )
+    for( vector<Vector6i>::iterator ls_it = ls_obs_list.end(); ls_it != ls_obs_list.begin(); ls_it-- )
     {
         if( (*ls_it)(5) == -1 )
         {
@@ -1977,14 +1834,6 @@ int MapHandler::levMarquardtOptimizationLBA( vector<double> X_aux, vector<int> k
 
         }
     }
-
-    m_insert_kf.unlock();
-
-    }
-    else
-        return -1;
-
-    return 0;
 
 }
 
@@ -2109,11 +1958,12 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
     SparseMatrix<double> H(N,N);
     for(int i = 0; i < N; i++)
         X.coeffRef(i) = X_aux[i];
-    H.reserve( VectorXi::Constant(N,5000) );
+    H.reserve( VectorXi::Constant(N,5000) );    //[TODO: change the allocation]
 
     // create Levenberg-Marquardt parameters
     double err, err_prev = 999999999.9;
-    double lambda = SlamConfig::lambdaLbaLM(), lambda_k = SlamConfig::lambdaLbaK();
+    double lambda = Config::lambdaLbaLM(), lambda_k = Config::lambdaLbaK(); // TODO: change variable name in case they are equal with EBA
+    int    max_iters = Config::maxItersLba();
 
     // estimate H and g to precalculate lambda
     //---------------------------------------------------------------------------------------------
@@ -2145,7 +1995,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             double gy   = Xwi(1);
             double gz   = Xwi(2);
             double gz2  = gz*gz;
-            gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2         = 1.0 / std::max(Config::homogTh(),gz2);
             double fx   = cam->getFx();
             double fy   = cam->getFy();
             double dx   = p_err(0);
@@ -2155,25 +2005,23 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             // estimate Jacobian wrt KF pose
             Vector6d Jij_Tiw = Vector6d::Zero();
             Jij_Tiw << + gz2 * fxdx * gz,
-                       + gz2 * fydy * gz,
-                       - gz2 * ( fxdx*gx + fydy*gy ),
-                       - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
-                       + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
-                       + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
-            Jij_Tiw = Jij_Tiw / std::max(SlamConfig::homogTh(),p_err_norm);
+                    + gz2 * fydy * gz,
+                    - gz2 * ( fxdx*gx + fydy*gy ),
+                    - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
+                    + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
+                    + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
+            Jij_Tiw = Jij_Tiw / std::max(Config::homogTh(),p_err_norm);
             // estimate Jacobian wrt LM
             Vector3d Jij_Xwj = Vector3d::Zero();
             Jij_Xwj << + gz2 * fxdx * gz,
-                       + gz2 * fydy * gz,
-                       - gz2 * ( fxdx*gx + fydy*gy );
-            Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(SlamConfig::homogTh(),p_err_norm);
+                    + gz2 * fydy * gz,
+                    - gz2 * ( fxdx*gx + fydy*gy );
+            Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(Config::homogTh(),p_err_norm);
             // if employing robust cost function
-            double w  = 1.0;
             double s2 = map_points[lm_idx_map]->sigma_list[lm_idx_obs];
-            //double w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
-            w = robustWeightCauchy(p_err_norm) ;
-
+            double w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
             // update hessian, gradient, and error
+            VectorXd g_aux = VectorXd::Zero(N);
             int idx = 6 * kf_idx_loc;
             int jdx = 6*Nkf + 3*lm_idx_loc;
             if( kf_idx_loc == -1 )
@@ -2260,7 +2108,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             double gy   = Pwi(1);
             double gz   = Pwi(2);
             double gz2  = gz*gz;
-            gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2         = 1.0 / std::max(Config::homogTh(),gz2);
             double fx   = cam->getFx();
             double fy   = cam->getFy();
             double lx   = l_err(0);
@@ -2270,47 +2118,47 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             // - jac. wrt. KF pose
             Vector6d Jij_Piw = Vector6d::Zero();
             Jij_Piw << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy ),
-                       - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                       + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                       + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy ),
+                    - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                    + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                    + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
             // - jac. wrt. LM
             Vector3d Jij_Pwj = Vector3d::Zero();
             Jij_Pwj << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy );
-            Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(SlamConfig::homogTh(),l_err_norm);
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy );
+            Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(Config::homogTh(),l_err_norm);
             // end point
             gx   = Qwi(0);
             gy   = Qwi(1);
             gz   = Qwi(2);
             gz2  = gz*gz;
-            gz2  = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+            gz2  = 1.0 / std::max(Config::homogTh(),gz2);
             // - jac. wrt. KF pose
             Vector6d Jij_Qiw = Vector6d::Zero();
             Jij_Qiw << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy ),
-                       - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                       + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                       + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy ),
+                    - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                    + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                    + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
             // - jac. wrt. LM
             Vector3d Jij_Qwj = Vector3d::Zero();
             Jij_Qwj << + gz2 * fxlx * gz,
-                       + gz2 * fyly * gz,
-                       - gz2 * ( fxlx*gx + fyly*gy );
-            Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(SlamConfig::homogTh(),l_err_norm);
+                    + gz2 * fyly * gz,
+                    - gz2 * ( fxlx*gx + fyly*gy );
+            Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(Config::homogTh(),l_err_norm);
             // estimate Jacobian wrt KF pose
             Vector6d Jij_Tiw = Vector6d::Zero();
-            Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(SlamConfig::homogTh(),l_err_norm);
+            Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(Config::homogTh(),l_err_norm);
             // estimate Jacobian wrt LM
             Vector6d Jij_Lwj = Vector6d::Zero();
             Jij_Lwj.head(3) = Jij_Pwj;
             Jij_Lwj.tail(3) = Jij_Qwj;
             // if employing robust cost function
-            double w  = 1.0;
-            w = robustWeightCauchy(l_err_norm) ;
+            double s2 = map_lines[lm_idx_map]->sigma_list[lm_idx_obs];
+            double w = 1.0 / ( 1.0 + l_err_norm * l_err_norm * s2 );
             // update hessian, gradient, and error
             VectorXd gi = VectorXd::Zero(N), gj = VectorXd::Zero(N);
             int idx = 6 * kf_idx_loc;
@@ -2354,7 +2202,6 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
         }
     }
     err /= (Npt_obs+Nls_obs);
-
     // initial guess of lambda
     int Hmax = 0.0;
     for( int i = 0; i < N; i++)
@@ -2376,7 +2223,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
     for( int i = 0; i < Nkf; i++)
     {
         Matrix4d Tprev = expmap_se3( X.block(6*i,0,6,1) );
-        Matrix4d Tcurr = Tprev * inverse_se3( expmap_se3( DX.block(6*i,0,6,1) ) );       
+        Matrix4d Tcurr = Tprev * inverse_se3( expmap_se3( DX.block(6*i,0,6,1) ) );
         X.block(6*i,0,6,1) = logmap_se3( Tcurr );
     }
     // update LMs
@@ -2388,7 +2235,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
     // LM iterations
     //---------------------------------------------------------------------------------------------
     int iters;
-    for( iters = 1; iters < SlamConfig::maxItersLba(); iters++ )
+    for( iters = 1; iters < Config::maxItersLba(); iters++ )
     {
         // estimate hessian and gradient (reset)
         DX.setZero();
@@ -2426,7 +2273,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
                 double gy   = Xwi(1);
                 double gz   = Xwi(2);
                 double gz2  = gz*gz;
-                gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+                gz2         = 1.0 / std::max(Config::homogTh(),gz2);
                 double fx   = cam->getFx();
                 double fy   = cam->getFy();
                 double dx   = p_err(0);
@@ -2436,22 +2283,23 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
                 // estimate Jacobian wrt KF pose
                 Vector6d Jij_Tiw = Vector6d::Zero();
                 Jij_Tiw << + gz2 * fxdx * gz,
-                           + gz2 * fydy * gz,
-                           - gz2 * ( fxdx*gx + fydy*gy ),
-                           - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
-                           + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
-                           + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
-                Jij_Tiw = Jij_Tiw / std::max(SlamConfig::homogTh(),p_err_norm);
+                        + gz2 * fydy * gz,
+                        - gz2 * ( fxdx*gx + fydy*gy ),
+                        - gz2 * ( fxdx*gx*gy + fydy*gy*gy + fydy*gz*gz ),
+                        + gz2 * ( fxdx*gx*gx + fxdx*gz*gz + fydy*gx*gy ),
+                        + gz2 * ( fydy*gx*gz - fxdx*gy*gz );
+                Jij_Tiw = Jij_Tiw / std::max(Config::homogTh(),p_err_norm);
                 // estimate Jacobian wrt LM
                 Vector3d Jij_Xwj = Vector3d::Zero();
                 Jij_Xwj << + gz2 * fxdx * gz,
-                           + gz2 * fydy * gz,
-                           - gz2 * ( fxdx*gx + fydy*gy );
-                Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(SlamConfig::homogTh(),p_err_norm);
+                        + gz2 * fydy * gz,
+                        - gz2 * ( fxdx*gx + fydy*gy );
+                Jij_Xwj = Jij_Xwj.transpose() * Tiw.block(0,0,3,3) / std::max(Config::homogTh(),p_err_norm);
                 // if employing robust cost function
-                double  w = 1.0;
-                w = robustWeightCauchy(p_err_norm) ;
+                double s2 = map_points[lm_idx_map]->sigma_list[lm_idx_obs];
+                double w = 1.0 / ( 1.0 + p_err_norm * p_err_norm * s2 );
                 // update hessian, gradient, and error
+                VectorXd g_aux = VectorXd::Zero(N);
                 int idx = 6 * kf_idx_loc;
                 int jdx = 6*Nkf + 3*lm_idx_loc;
                 if( kf_idx_loc == -1 )
@@ -2515,10 +2363,8 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             if( map_lines[lm_idx_map] != NULL && map_keyframes[kf_idx_map] != NULL)
             {
                 // grab 3D LM (Pwj and Qwj)
-                //Vector3d Pwj   = map_lines[lm_idx_map]->line3D.head(3);
-                //Vector3d Qwj   = map_lines[lm_idx_map]->line3D.tail(3);
-                Vector3d Pwj = X.block(6*Nkf+3*Npt+3*lm_idx_loc,0,3,1);
-                Vector3d Qwj = X.block(6*Nkf+3*Npt+3*lm_idx_loc,0,3,1);
+                Vector3d Pwj   = map_lines[lm_idx_map]->line3D.head(3);
+                Vector3d Qwj   = map_lines[lm_idx_map]->line3D.tail(3);
                 // grab 6DoF KF (Tiw)
                 Matrix4d Tiw   = map_keyframes[kf_idx_map]->T_kf_w;
                 // projection error
@@ -2537,7 +2383,7 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
                 double gy   = Pwi(1);
                 double gz   = Pwi(2);
                 double gz2  = gz*gz;
-                gz2         = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+                gz2         = 1.0 / std::max(Config::homogTh(),gz2);
                 double fx   = cam->getFx();
                 double fy   = cam->getFy();
                 double lx   = l_err(0);
@@ -2547,49 +2393,47 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
                 // - jac. wrt. KF pose
                 Vector6d Jij_Piw = Vector6d::Zero();
                 Jij_Piw << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy ),
-                           - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                           + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                           + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy ),
+                        - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                        + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                        + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
                 // - jac. wrt. LM
                 Vector3d Jij_Pwj = Vector3d::Zero();
                 Jij_Pwj << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy );
-                Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(SlamConfig::homogTh(),l_err_norm);
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy );
+                Jij_Pwj = Jij_Pwj.transpose() * Tiw.block(0,0,3,3) * l_err(0) / std::max(Config::homogTh(),l_err_norm);
                 // end point
                 gx   = Qwi(0);
                 gy   = Qwi(1);
                 gz   = Qwi(2);
                 gz2  = gz*gz;
-                gz2  = 1.0 / std::max(SlamConfig::homogTh(),gz2);
+                gz2  = 1.0 / std::max(Config::homogTh(),gz2);
                 // - jac. wrt. KF pose
                 Vector6d Jij_Qiw = Vector6d::Zero();
                 Jij_Qiw << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy ),
-                           - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
-                           + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
-                           + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy ),
+                        - gz2 * ( fxlx*gx*gy + fyly*gy*gy + fyly*gz*gz ),
+                        + gz2 * ( fxlx*gx*gx + fxlx*gz*gz + fyly*gx*gy ),
+                        + gz2 * ( fyly*gx*gz - fxlx*gy*gz );
                 // - jac. wrt. LM
                 Vector3d Jij_Qwj = Vector3d::Zero();
                 Jij_Qwj << + gz2 * fxlx * gz,
-                           + gz2 * fyly * gz,
-                           - gz2 * ( fxlx*gx + fyly*gy );
-                Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(SlamConfig::homogTh(),l_err_norm);
+                        + gz2 * fyly * gz,
+                        - gz2 * ( fxlx*gx + fyly*gy );
+                Jij_Qwj = Jij_Qwj.transpose() * Tiw.block(0,0,3,3) * l_err(1) / std::max(Config::homogTh(),l_err_norm);
                 // estimate Jacobian wrt KF pose
                 Vector6d Jij_Tiw = Vector6d::Zero();
-                Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(SlamConfig::homogTh(),l_err_norm);
+                Jij_Tiw = ( Jij_Piw * l_err(0) + Jij_Qiw * l_err(1) ) / std::max(Config::homogTh(),l_err_norm);
                 // estimate Jacobian wrt LM
                 Vector6d Jij_Lwj = Vector6d::Zero();
                 Jij_Lwj.head(3) = Jij_Pwj;
                 Jij_Lwj.tail(3) = Jij_Qwj;
                 // if employing robust cost function
-                double  w = 1.0;
                 double s2 = map_lines[lm_idx_map]->sigma_list[lm_idx_obs];
-                //double w = 1.0 / ( 1.0 + l_err_norm * l_err_norm * s2 );
-                w = robustWeightCauchy(l_err_norm) ;
+                double w = 1.0 / ( 1.0 + l_err_norm * l_err_norm * s2 );
                 // update hessian, gradient, and error
                 VectorXd gi = VectorXd::Zero(N), gj = VectorXd::Zero(N);
                 int idx = 6 * kf_idx_loc;
@@ -2663,12 +2507,13 @@ void MapHandler::levMarquardtOptimizationGBA( vector<double> X_aux, vector<int> 
             for( int i = 6*Nkf; i < N; i++)
                 X(i) += DX(i);
         }
-        // if the parameter change is small stop
+        // if the parameter change is small stop (TODO: change with two parameters, one for R and another one for t)
         if( DX.norm() < numeric_limits<double>::epsilon() )
             break;
         // update previous values
         err_prev = err;
     }
+    cout << endl << endl << "GBA iterations: " << iters << endl;
 
     // Update KFs and LMs
     //---------------------------------------------------------------------------------------------
@@ -2712,7 +2557,7 @@ void MapHandler::removeBadMapLandmarks()
         {
             if( (*pt_it)->local == false && max_kf_idx - (*pt_it)->kf_obs_list[0] > 10 )
             {
-                if( (*pt_it)->inlier == false || (*pt_it)->obs_list.size() < SlamConfig::minLMObs() )
+                if( (*pt_it)->inlier == false || (*pt_it)->obs_list.size() < Config::minLMObs() )
                 {
                     int kf_obs = (*pt_it)->kf_obs_list[0];
                     int lm_idx = (*pt_it)->idx;
@@ -2723,7 +2568,7 @@ void MapHandler::removeBadMapLandmarks()
                         if( (*st_pt)->idx == lm_idx )
                         {
                             (*st_pt)->idx = -1;
-                            break;
+                            st_pt = map_keyframes[kf_obs]->stereo_frame->stereo_pt.end()-1;
                         }
                     }
                     // remove from map_points_kf_idx
@@ -2737,8 +2582,7 @@ void MapHandler::removeBadMapLandmarks()
                         }
                     }
                     // remove LM
-                    delete (*pt_it);
-                    (*pt_it) = nullptr;
+                    (*pt_it) = NULL;
                 }
             }
         }
@@ -2747,11 +2591,11 @@ void MapHandler::removeBadMapLandmarks()
     // line features
     for( vector<MapLine*>::iterator ls_it = map_lines.begin(); ls_it != map_lines.end(); ls_it++)
     {
-        if((*ls_it) != NULL)
+        if( (*ls_it)!=NULL )
         {
             if( (*ls_it)->local == false && max_kf_idx-(*ls_it)->kf_obs_list[0] > 10 )
             {
-                if( (*ls_it)->inlier == false || (*ls_it)->obs_list.size() < SlamConfig::minLMObs() )
+                if( (*ls_it)->inlier == false || (*ls_it)->obs_list.size() < Config::minLMObs() )
                 {
                     int kf_obs = (*ls_it)->kf_obs_list[0];
                     int lm_idx = (*ls_it)->idx;
@@ -2762,7 +2606,7 @@ void MapHandler::removeBadMapLandmarks()
                         if( (*st_ls)->idx == lm_idx )
                         {
                             (*st_ls)->idx = -1;
-                            break;
+                            st_ls = map_keyframes[kf_obs]->stereo_frame->stereo_ls.end()-1;
                         }
                     }
                     // remove from map_points_kf_idx
@@ -2777,12 +2621,12 @@ void MapHandler::removeBadMapLandmarks()
                     }
 
                     // remove LM
-                    delete (*ls_it);
-                    (*ls_it) = nullptr;
+                    (*ls_it) = NULL;
                 }
             }
         }
     }
+
 }
 
 void MapHandler::removeRedundantKFs()
@@ -2792,7 +2636,7 @@ void MapHandler::removeRedundantKFs()
     vector<int> kf_idxs;
     for( vector<KeyFrame*>::iterator kf_it = map_keyframes.begin(); kf_it != map_keyframes.end(); kf_it++)
     {
-        if((*kf_it) != NULL)
+        if( (*kf_it)!= NULL )
         {
             int kf_idx = (*kf_it)->kf_idx;
             if( !(*kf_it)->local && kf_idx > 1 && kf_idx < max_kf_idx )
@@ -2811,20 +2655,28 @@ void MapHandler::removeRedundantKFs()
                     if( (*ls_it)->idx != -1 )
                         n_feats++;
                 }
-                int max_n_feats = int( SlamConfig::maxCommonFtsKF() * double(n_feats) );
+                int max_n_feats = int( Config::maxCommonFtsKF() * double(n_feats) );
                 // check if the KF is redundant
                 int n_graph = full_graph.size();
                 for(int i = 0; i < n_graph-1, i != kf_idx; i++)
                 {
                     if( map_keyframes[i] != NULL )
                     {
-                        if( full_graph[kf_idx][i] > n_feats )
+//                        if( full_graph[kf_idx][i] > n_feats )
+                        if( full_graph[kf_idx][i] > max_n_feats )
                             kf_idxs.push_back(kf_idx);
                     }
                 }
             }
         }
     }
+    if( kf_idxs.size() != 0 )
+    {
+        cout << endl << "KFs to be erased: ";
+        for(int i = 0; i < kf_idxs.size(); i++)
+            cout << kf_idxs[i] << " " ;
+    }
+    cout << endl ;
 
     // eliminate KFs, LMs observed only by this KFs, and all observations from this KF
     for( int i = 0; i < kf_idxs.size(); i++)
@@ -2837,7 +2689,7 @@ void MapHandler::removeRedundantKFs()
             {
                 for( auto it = map_points_kf_idx.at(kf_idx).begin(); it != map_points_kf_idx.at(kf_idx).end(); it++)
                 {
-                    if( map_points[(*it)] != NULL &&  map_points[(*it)]->kf_obs_list.size() <= 1 )
+                    if( map_points[(*it)]!= NULL &&  map_points[(*it)]->kf_obs_list.size() <= 1 )
                     {
                         bool found = false;
                         for( int k = 1; k < map_points[(*it)]->kf_obs_list.size(); k++)
@@ -2929,10 +2781,17 @@ void MapHandler::removeRedundantKFs()
             }
 
             // erase KF
-            delete map_keyframes[kf_idx];
-            map_keyframes[kf_idx] = nullptr;
+            map_keyframes[kf_idx] = NULL;
         }
     }
+
+    if( kf_idxs.size() != 0 )
+        cout << endl << "Erased, now update graph" << endl;
+
+    // update graphs
+    if( kf_idxs.size() != 0 )
+        cout << endl << "Success erasing KFs" << endl;
+
 }
 
 // -----------------------------------------------------------------------------------------------------------------------------
@@ -2942,14 +2801,12 @@ void MapHandler::removeRedundantKFs()
 void MapHandler::loopClosure()
 {
 
-    Timer timer;
-
     // look for loop closure candidates
     int kf_prev_idx, kf_curr_idx;
     kf_curr_idx = max_kf_idx;
-    timer.start();
+    clock.Tic();
     bool is_lc_candidate = lookForLoopCandidates(kf_curr_idx,kf_prev_idx);
-    time(4) = timer.stop(); // ms
+    time(4) = 1000 * clock.Tac(); //ms
 
     // compute relative transformation if it is LC candidate
     if( is_lc_candidate )
@@ -2958,9 +2815,9 @@ void MapHandler::loopClosure()
         vector<PointFeature*> lc_points;
         vector<LineFeature*>  lc_lines;
         Vector6d pose_inc;
-        timer.start();
+        clock.Tic();
         bool isLC = isLoopClosure( map_keyframes[kf_prev_idx], map_keyframes[kf_curr_idx], pose_inc, lc_pt_idx, lc_ls_idx, lc_points, lc_lines );
-        time(5) = timer.stop(); //ms
+        time(5) = 1000 * clock.Tac(); //ms
         // if it is loop closure, add information and update status
         if( isLC )
         {
@@ -2974,87 +2831,98 @@ void MapHandler::loopClosure()
             lc_idx(2) = 1;
             lc_idxs.push_back( lc_idx );
             lc_idx_list.push_back(lc_idx);
-            if( lc_state == LC_IDLE )
-                lc_state = LC_ACTIVE;
+            if( lc_status == LC_IDLE )
+            {
+                cout << endl << "Lopp closure is now active." << endl;
+                lc_status = LC_ACTIVE;
+            }
         }
         else
         {
-            if( lc_state == LC_ACTIVE )
-                lc_state = LC_READY;
+            if( lc_status == LC_ACTIVE )
+                lc_status = LC_READY;
         }
-
-        for (PointFeature* pt : lc_points)
-            delete pt;
-        for (LineFeature* ls : lc_lines)
-            delete ls;
+        cout << "isLC      = " << isLC << endl;
+        cout << "LC_status = " << lc_status << endl;
     }
     else
     {
-        if( lc_state == LC_ACTIVE )
-            lc_state = LC_READY;
+        if( lc_status == LC_ACTIVE )
+            lc_status = LC_READY;
     }
 
     // LC computation
-    if( lc_state == LC_READY )  // add condition indicating that the LC has finished
+    if( lc_status == LC_READY )  // add condition indicating that the LC has finished (i.e. the car pass by an already visited street)
     {
-        timer.start();
+        clock.Tic();
         loopClosureOptimizationCovGraphG2O();
-        time(6) = timer.stop(); //ms
-        lc_state = LC_IDLE;
+        time(6) = 1000 * clock.Tac(); //ms
+        lc_status = LC_IDLE;
     }
+
 }
 
-void MapHandler::insertKFBowVectorP( KeyFrame* kf  )
+void MapHandler::insertKFBowVectorP( KeyFrame* &kf  )
 {
 
     // transform Mat to vector<Mat>
     vector<Mat> curr_desc;
     curr_desc.reserve( kf->stereo_frame->pdesc_l.rows );
     for ( int i = 0; i < kf->stereo_frame->pdesc_l.rows; i++ )
+    {
         curr_desc.push_back( kf->stereo_frame->pdesc_l.row(i) );
+    }
     // transform to DBoW2::BowVector
-    dbow_voc_p.transform( curr_desc, kf->descDBoW_P );
-
+    BowVector kf_bv;
+    dbow_voc_p.transform( curr_desc, kf_bv );
+    kf->descDBoW_P = kf_bv;
     // fill the confusion matrix for the new KF
     int idx = kf->kf_idx;
+    int max_kf = map_keyframes.size();
     for( int i = 0; i < idx; i++)
     {
         if( map_keyframes[i] != NULL )
         {
-            double score = dbow_voc_p.score( kf->descDBoW_P, map_keyframes[i]->descDBoW_P );
+            double score = dbow_voc_p.score( kf_bv, map_keyframes[i]->descDBoW_P );
             conf_matrix[idx][i] = score;
             conf_matrix[i][idx] = score;
         }
     }
-    conf_matrix[idx][idx] = dbow_voc_p.score( kf->descDBoW_P, kf->descDBoW_P );
+    conf_matrix[idx][idx] = dbow_voc_p.score( kf_bv, kf_bv );
+
 }
 
-void MapHandler::insertKFBowVectorL( KeyFrame* kf  )
+void MapHandler::insertKFBowVectorL( KeyFrame* &kf  )
 {
 
     // transform Mat to vector<Mat>
     vector<Mat> curr_desc;
     curr_desc.reserve( kf->stereo_frame->ldesc_l.rows );
     for ( int i = 0; i < kf->stereo_frame->ldesc_l.rows; i++ )
+    {
         curr_desc.push_back( kf->stereo_frame->ldesc_l.row(i) );
+    }
     // transform to DBoW2::BowVector
-    dbow_voc_l.transform( curr_desc, kf->descDBoW_L );
-
+    BowVector kf_bv;
+    dbow_voc_l.transform( curr_desc, kf_bv );
+    kf->descDBoW_L = kf_bv;
     // fill the confusion matrix for the new KF
     int idx = kf->kf_idx;
+    int max_kf = map_keyframes.size();
     for( int i = 0; i < idx; i++)
     {
         if( map_keyframes[i] != NULL )
         {
-            double score = dbow_voc_l.score( kf->descDBoW_L, map_keyframes[i]->descDBoW_L );
+            double score = dbow_voc_l.score( kf_bv, map_keyframes[i]->descDBoW_L );
             conf_matrix[idx][i] = score;
             conf_matrix[i][idx] = score;
         }
     }
-    conf_matrix[idx][idx] = dbow_voc_l.score( kf->descDBoW_L, kf->descDBoW_L );
+    conf_matrix[idx][idx] = dbow_voc_l.score( kf_bv, kf_bv );
+
 }
 
-void MapHandler::insertKFBowVectorPL( KeyFrame* kf  )
+void MapHandler::insertKFBowVectorPL( KeyFrame* &kf  )
 {
 
     // Point Features
@@ -3065,14 +2933,15 @@ void MapHandler::insertKFBowVectorPL( KeyFrame* kf  )
     for ( int i = 0; i < kf->stereo_frame->pdesc_l.rows; i++ )
         curr_desc.push_back( kf->stereo_frame->pdesc_l.row(i) );
     // transform to DBoW2::BowVector
-    dbow_voc_p.transform( curr_desc, kf->descDBoW_P );
-
+    BowVector kf_bv_p;
+    dbow_voc_p.transform( curr_desc, kf_bv_p );
+    kf->descDBoW_P = kf_bv_p;
     // estimate dispersion of point features
     vector<double> pt_x, pt_y;
-    for (PointFeature* pt : kf->stereo_frame->stereo_pt)
+    for( auto it = kf->stereo_frame->stereo_pt.begin(); it != kf->stereo_frame->stereo_pt.end(); it++ )
     {
-        pt_x.push_back( pt->pl(0) );
-        pt_y.push_back( pt->pl(1) );
+        pt_x.push_back( (*it)->pl(0) );
+        pt_y.push_back( (*it)->pl(1) );
     }
     double std_pt = vector_stdv( pt_x ) + vector_stdv( pt_y );
     int    n_pt   = pt_x.size();
@@ -3085,14 +2954,15 @@ void MapHandler::insertKFBowVectorPL( KeyFrame* kf  )
     for ( int i = 0; i < kf->stereo_frame->ldesc_l.rows; i++ )
         curr_desc.push_back( kf->stereo_frame->ldesc_l.row(i) );
     // transform to DBoW2::BowVector
-    dbow_voc_l.transform( curr_desc, kf->descDBoW_L );
-
+    BowVector kf_bv_l;
+    dbow_voc_l.transform( curr_desc, kf_bv_l );
+    kf->descDBoW_L = kf_bv_l;
     // estimate dispersion of point features
     vector<double> ls_x, ls_y;
-    for (LineFeature* ls : kf->stereo_frame->stereo_ls)
+    for( auto it = kf->stereo_frame->stereo_ls.begin(); it != kf->stereo_frame->stereo_ls.end(); it++ )
     {
         Vector2d mp;
-        mp << (ls->spl + ls->epl)*0.5;
+        mp << ((*it)->spl + (*it)->epl)*0.5;
         ls_x.push_back( mp(0) );
         ls_y.push_back( mp(1) );
     }
@@ -3106,12 +2976,13 @@ void MapHandler::insertKFBowVectorPL( KeyFrame* kf  )
     // fill the confusion matrix for the new KF
     double score, score_p, score_l;
     int idx = kf->kf_idx;
+    int max_kf = map_keyframes.size();
     for( int i = 0; i < idx; i++)
     {
         if( map_keyframes[i] != NULL )
         {
-            score_p = dbow_voc_p.score( kf->descDBoW_P, map_keyframes[i]->descDBoW_P );
-            score_l = dbow_voc_l.score( kf->descDBoW_L, map_keyframes[i]->descDBoW_L );
+            score_p = dbow_voc_p.score( kf_bv_p, map_keyframes[i]->descDBoW_P );
+            score_l = dbow_voc_l.score( kf_bv_l, map_keyframes[i]->descDBoW_L );
             score = 0.0;
             score += ( score_p * n_pt   + score_l * n_ls   ) / n_pl;    // strategy#1
             score += ( score_p * std_pt + score_l * std_ls ) / std_pl;  // strategy#2
@@ -3119,24 +2990,27 @@ void MapHandler::insertKFBowVectorPL( KeyFrame* kf  )
             conf_matrix[i][idx] = score;
         }
     }
-    score_p = dbow_voc_p.score( kf->descDBoW_P, kf->descDBoW_P );
-    score_l = dbow_voc_l.score( kf->descDBoW_L, kf->descDBoW_L);
+    score_p = dbow_voc_p.score( kf_bv_p, kf_bv_p );
+    score_l = dbow_voc_l.score( kf_bv_l, kf_bv_l );
     score = 0.0;
     score += ( score_p * n_pt   + score_l * n_ls   ) / n_pl;    // strategy#1
     score += ( score_p * std_pt + score_l * std_ls ) / std_pl;  // strategy#2
     conf_matrix[idx][idx] = score;
+
 }
 
 bool MapHandler::lookForLoopCandidates( int kf_curr_idx, int &kf_prev_idx )
 {
+
+    // variables to be included in config ( besides K which is used in loopClosure() )
     bool is_lc_candidate = false;
     kf_prev_idx = -1;
 
     // find the best matches
     vector<Vector2d> max_confmat;
-    for(int i = 0; i < kf_curr_idx - SlamConfig::lcKFDist(); i++)
+    for(int i = 0; i < kf_curr_idx - Config::lcKFDist(); i++)
     {
-        if( map_keyframes[i] != NULL )
+        if( map_keyframes[i]!=NULL )
         {
             Vector2d aux;
             aux(0) = i;
@@ -3144,23 +3018,23 @@ bool MapHandler::lookForLoopCandidates( int kf_curr_idx, int &kf_prev_idx )
             max_confmat.push_back( aux );
         }
     }
+    sort( max_confmat.begin(), max_confmat.end(), sort_confmat_by_score() );
+
+    // find the minimum score in the covisibility graph (and/or 3 previous keyframes)
+    double lc_min_score = 1.0;
+    for( int i = 0; i < kf_curr_idx; i++ )
+    {
+        if( full_graph[i][kf_curr_idx] >= Config::minLMCovGraph() || kf_curr_idx - i <= Config::minKFLocalMap()+3 )
+        {
+            double score_i = conf_matrix[i][kf_curr_idx];
+            if( score_i < lc_min_score && score_i > 0.001 )
+                lc_min_score = score_i;
+        }
+    }
 
     // if there are enough matches..
-    if( max_confmat.size() > SlamConfig::lcKFMaxDist() )
+    if( max_confmat.size() > Config::lcKFMaxDist() )
     {
-        sort( max_confmat.begin(), max_confmat.end(), sort_confmat_by_score() );
-
-        // find the minimum score in the covisibility graph
-        double lc_min_score = 1.0;
-        for( int i = 0; i < kf_curr_idx; i++ )
-        {
-            if( full_graph[i][kf_curr_idx] >= SlamConfig::minLMCovGraph() || kf_curr_idx - i <= SlamConfig::minKFLocalMap()+3 )
-            {
-                double score_i = conf_matrix[i][kf_curr_idx];
-                if( score_i < lc_min_score && score_i > 0.001 )
-                    lc_min_score = score_i;
-            }
-        }
 
         // the best match must has an score above lc_dbow_score_max
         int idx_max = int( max_confmat[0](0) );
@@ -3171,25 +3045,37 @@ bool MapHandler::lookForLoopCandidates( int kf_curr_idx, int &kf_prev_idx )
             for( int i = 1; i < max_confmat.size(); i++ )
             {
                 int idx = int( max_confmat[i](0) );
-                // frame closest && connected by the cov_graph && score > lc_dbow_score_min
-                if( abs(idx-idx_max) <= SlamConfig::lcKFMaxDist() &&
-                    max_confmat[i](1) >= lc_min_score * 0.8 )
-                    Nkf_closest++;
-            }
-
-            // update in case of being loop closure candidate
-            if( Nkf_closest >= SlamConfig::lcNKFClosest() )
-            {
-                is_lc_candidate = true;
-                kf_prev_idx     = idx_max;
+                        // frame closest && connected by the cov_graph && score > lc_dbow_score_min
+                        if( abs(idx-idx_max) <= Config::lcKFMaxDist() &&
+                            //full_graph[idx][idx_max] >= Config::minLMCovGraph() &&
+                            max_confmat[i](1) >= lc_min_score * 0.8 )
+                            Nkf_closest++;
             }
         }
+
+        // update in case of being loop closure candidate
+        if( Nkf_closest >= Config::lcNKFClosest() )
+        {
+            is_lc_candidate = true;
+            kf_prev_idx     = idx_max;
+        }
+
+
+        // ****************************************************************** //
+        cout << endl << "lc_min_score: " << lc_min_score        ;
+        cout << endl << "Nkf_closest:  " << Nkf_closest         ;
+        cout << endl << "idx_max:  "     << idx_max  << endl;
+        for( int i = 0; i < Config::lcKFMaxDist(); i++ )
+            cout <<  max_confmat[i](0) << "\t" <<  max_confmat[i](1) << endl;
+        // ****************************************************************** //
+
     }
 
     return is_lc_candidate;
+
 }
 
-bool MapHandler::isLoopClosure( const KeyFrame* kf0, const KeyFrame* kf1, Vector6d &pose_inc,
+bool MapHandler::isLoopClosure( KeyFrame* kf0, KeyFrame* kf1, Vector6d &pose_inc,
                                 vector<Vector4i> &lc_pt_idx, vector<Vector4i> &lc_ls_idx,
                                 vector<PointFeature*> &lc_points, vector<LineFeature*>  &lc_lines)
 {
@@ -3208,8 +3094,6 @@ bool MapHandler::isLoopClosure( const KeyFrame* kf0, const KeyFrame* kf1, Vector
     Matrix4d DT = Matrix4d::Identity();
 
     // structures to optimize camera drift
-    lc_pt_idx.clear();
-    lc_ls_idx.clear();
     lc_points.clear();
     lc_lines.clear();
 
@@ -3217,56 +3101,150 @@ bool MapHandler::isLoopClosure( const KeyFrame* kf0, const KeyFrame* kf1, Vector
     // ---------------------------------------------------
     // points f2f tracking
     int common_pt = 0;
-    if( SlamConfig::hasPoints() && !kf1->stereo_frame->stereo_pt.empty() && !kf0->stereo_frame->stereo_pt.empty() )
+    if( Config::hasPoints() && !(kf1->stereo_frame->stereo_pt.size()==0) && !(kf0->stereo_frame->stereo_pt.size()==0)  )
     {
-        vector<int> matches_12;
-        common_pt = match(kf0->stereo_frame->pdesc_l, kf1->stereo_frame->pdesc_l, SlamConfig::minRatio12P(), matches_12);
-
-        for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-            const int i2 = matches_12[i1];
-            if (i2 < 0) continue;
-
-            // save data for optimization
-            Vector3d P       = kf0->stereo_frame->stereo_pt[i1]->P;
-            Vector2d pl_obs  = kf1->stereo_frame->stereo_pt[i2]->pl;
-            PointFeature* pt = new PointFeature( P, pl_obs );
-            lc_points.push_back(pt);
-            // save indices for fusing LMs
-            Vector4i idx;
-            idx(0) = kf0->stereo_frame->stereo_pt[i1]->idx;
-            idx(1) = i1;
-            idx(2) = kf1->stereo_frame->stereo_pt[i2]->idx;
-            idx(3) = i2;
-            lc_pt_idx.push_back(idx);
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        Mat pdesc_l1, pdesc_l2;
+        vector<vector<DMatch>> pmatches_12, pmatches_21;
+        // 12 and 21 matches
+        pdesc_l1 = kf0->stereo_frame->pdesc_l;
+        pdesc_l2 = kf1->stereo_frame->pdesc_l;
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchPointFeatures, kf0->stereo_frame, bfm, pdesc_l1, pdesc_l2, ref(pmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchPointFeatures, kf0->stereo_frame, bfm, pdesc_l2, pdesc_l1, ref(pmatches_21) );
+                match_l.wait();
+                match_r.wait();
+            }
+            else
+            {
+                bfm->knnMatch( pdesc_l1, pdesc_l2, pmatches_12, 2);
+                bfm->knnMatch( pdesc_l2, pdesc_l1, pmatches_21, 2);
+            }
+        }
+        else
+            bfm->knnMatch( pdesc_l1, pdesc_l2, pmatches_12, 2);
+        // sort matches by the distance between the best and second best matches
+        //        double nn12_dist_th = Config::maxRatio12P();
+        // resort according to the queryIdx
+        sort( pmatches_12.begin(), pmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( pmatches_21.begin(), pmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around pmatches
+        for( int i = 0; i < pmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = pmatches_12[i][0].queryIdx;
+            int lr_tdx = pmatches_12[i][0].trainIdx;
+            int rl_tdx;
+            if( Config::bestLRMatches() )
+                rl_tdx = pmatches_21[lr_tdx][0].trainIdx;
+            else
+                rl_tdx = lr_qdx;
+            // check if they are mutual best matches and the minimum distance
+            //            double dist_nn = pmatches_12[i][0].distance;
+            //            double dist_12 = pmatches_12[i][0].distance / pmatches_12[i][1].distance;
+            // check the f2f max disparity condition
+            if( lr_qdx == rl_tdx  )
+            {
+                common_pt++;
+                // save data for optimization
+                Vector3d P       = kf0->stereo_frame->stereo_pt[lr_qdx]->P;
+                Vector2d pl_obs  = kf1->stereo_frame->stereo_pt[lr_tdx]->pl;
+                PointFeature* pt = new PointFeature( P, pl_obs );
+                lc_points.push_back(pt);
+                // save indices for fusing LMs
+                Vector4i idx;
+                idx(0) = kf0->stereo_frame->stereo_pt[lr_qdx]->idx;
+                idx(1) = lr_qdx;
+                idx(2) = kf1->stereo_frame->stereo_pt[lr_tdx]->idx;
+                idx(3) = lr_tdx;
+                lc_pt_idx.push_back(idx);
+            }
         }
     }
 
     // line segments f2f tracking
     int common_ls = 0;
-    if( SlamConfig::hasLines() && !kf1->stereo_frame->stereo_ls.empty() && !kf0->stereo_frame->stereo_ls.empty() )
+    if( Config::hasLines() && !(kf1->stereo_frame->stereo_ls.size()==0) && !(kf0->stereo_frame->stereo_ls.size()==0)  )
     {
-        vector<int> matches_12;
-        common_ls = match(kf0->stereo_frame->ldesc_l, kf1->stereo_frame->ldesc_l, SlamConfig::minRatio12L(), matches_12);
-
-        for (int i1 = 0; i1 < matches_12.size(); ++i1) {
-            const int i2 = matches_12[i1];
-            if (i2 < 0) continue;
-
-            // save data for optimization
-            Vector3d sP     = kf0->stereo_frame->stereo_ls[i1]->sP;
-            Vector3d eP     = kf0->stereo_frame->stereo_ls[i1]->eP;
-            Vector3d le_obs = kf1->stereo_frame->stereo_ls[i2]->le;
-            LineFeature* ls = new LineFeature( sP, eP, le_obs, kf1->stereo_frame->stereo_ls[i2]->spl, kf1->stereo_frame->stereo_ls[i2]->epl );
-            lc_lines.push_back(ls);
-            // save indices for fusing LMs
-            Vector4i idx;
-            idx(0) = kf0->stereo_frame->stereo_ls[i1]->idx;
-            idx(1) = i1;
-            idx(2) = kf1->stereo_frame->stereo_ls[i2]->idx;
-            idx(3) = i2;
-            lc_ls_idx.push_back(idx);
+        BFMatcher* bfm = new BFMatcher( NORM_HAMMING, false );    // cross-check
+        Mat ldesc_l1, ldesc_l2;
+        vector<vector<DMatch>> lmatches_12, lmatches_21;
+        // 12 and 21 matches
+        ldesc_l1 = kf0->stereo_frame->ldesc_l;
+        ldesc_l2 = kf1->stereo_frame->ldesc_l;
+        if( Config::bestLRMatches() )
+        {
+            if( Config::lrInParallel() )
+            {
+                auto match_l = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, ldesc_l1, ldesc_l2, ref(lmatches_12) );
+                auto match_r = async( launch::async, &StVO::StereoFrame::matchLineFeatures, kf0->stereo_frame, bfm, ldesc_l2, ldesc_l1, ref(lmatches_21) );
+                match_l.wait();
+                match_r.wait();
+            }
+            else
+            {
+                bfm->knnMatch( ldesc_l1, ldesc_l2, lmatches_12, 2);
+                bfm->knnMatch( ldesc_l2, ldesc_l1, lmatches_21, 2);
+            }
         }
+        else
+            bfm->knnMatch( ldesc_l1, ldesc_l2, lmatches_12, 2);
+
+        // sort matches by the distance between the best and second best matches
+        double nn_dist_th, nn12_dist_th;
+        kf0->stereo_frame->lineDescriptorMAD(lmatches_12,nn_dist_th, nn12_dist_th);
+        nn12_dist_th  = nn12_dist_th * Config::descThL();
+        // resort according to the queryIdx
+        sort( lmatches_12.begin(), lmatches_12.end(), sort_descriptor_by_queryIdx() );
+        if( Config::bestLRMatches() )
+            sort( lmatches_21.begin(), lmatches_21.end(), sort_descriptor_by_queryIdx() );
+        // bucle around lmatches
+        for( int i = 0; i < lmatches_12.size(); i++ )
+        {
+            // check if they are mutual best matches
+            int lr_qdx = lmatches_12[i][0].queryIdx;
+            int lr_tdx = lmatches_12[i][0].trainIdx;
+            int rl_tdx;
+            if( Config::bestLRMatches() )
+                rl_tdx = lmatches_21[lr_tdx][0].trainIdx;
+            else
+                rl_tdx = lr_qdx;
+            // check if they are mutual best matches and the minimum distance
+            double dist_12 = lmatches_12[i][1].distance - lmatches_12[i][0].distance;
+            // f2f angle diff and flow
+            double a1 = kf0->stereo_frame->stereo_ls[lr_qdx]->angle;
+            double a2 = kf1->stereo_frame->stereo_ls[lr_tdx]->angle;
+            Vector2d x1 = (kf0->stereo_frame->stereo_ls[lr_qdx]->spl + kf0->stereo_frame->stereo_ls[lr_qdx]->epl);
+            Vector2d x2 = (kf1->stereo_frame->stereo_ls[lr_tdx]->spl + kf1->stereo_frame->stereo_ls[lr_tdx]->epl);
+            if( lr_qdx == rl_tdx  )
+            {
+                common_ls++;
+                // save data for optimization
+                Vector3d sP     = kf0->stereo_frame->stereo_ls[lr_qdx]->sP;
+                Vector3d eP     = kf0->stereo_frame->stereo_ls[lr_qdx]->eP;
+                Vector3d le_obs = kf1->stereo_frame->stereo_ls[lr_tdx]->le;
+                LineFeature* ls = new LineFeature( sP, eP, le_obs, kf1->stereo_frame->stereo_ls[lr_tdx]->spl, kf1->stereo_frame->stereo_ls[lr_tdx]->epl );
+                lc_lines.push_back(ls);
+                // save indices for fusing LMs
+                Vector4i idx;
+                idx(0) = kf0->stereo_frame->stereo_ls[lr_qdx]->idx;
+                idx(1) = lr_qdx;
+                idx(2) = kf1->stereo_frame->stereo_ls[lr_tdx]->idx;
+                idx(3) = lr_tdx;
+                lc_ls_idx.push_back(idx);
+            }
+        }
+
     }
+
+    cout << endl << "[Checking Loop Closure]:" << endl;
+    cout << "%Found points: " << 100.0 * common_pt / n_pt_0 << " / " << 100.0 * common_pt / n_pt_1 << endl;
+    cout << "%Found lines:  " << 100.0 * common_ls / n_ls_0 << " / " << 100.0 * common_ls / n_ls_1 << endl;
+    cout << "Common points (without map): " << common_pt << " \t Common lines (without map): " << common_ls << endl ;
 
     // estimate relative pose between both KFs
     // ---------------------------------------------------
@@ -3274,26 +3252,25 @@ bool MapHandler::isLoopClosure( const KeyFrame* kf0, const KeyFrame* kf1, Vector
     double inl_ratio_ls = max( 100.0 * common_ls / n_ls_0, 100.0 * common_ls / n_ls_1 );
     bool inl_ratio_condition = false;
 
-    if( SlamConfig::hasPoints() && SlamConfig::hasLines() )
+    // TODO: ignore this condition?
+    inl_ratio_condition = true;
+    if( Config::hasPoints() && Config::hasLines() )
     {
-        if( inl_ratio_pt > SlamConfig::lcInlierRatio() && inl_ratio_ls > SlamConfig::lcInlierRatio() )
+        if( inl_ratio_pt > Config::lcInlierRatio() && inl_ratio_ls >Config::lcInlierRatio() )
             inl_ratio_condition = true;
     }
-    else if( SlamConfig::hasPoints() )
+    else if( Config::hasPoints() && !Config::hasLines() )
     {
-        if( inl_ratio_pt > SlamConfig::lcInlierRatio() )
+        if( inl_ratio_pt > Config::lcInlierRatio() )
             inl_ratio_condition = true;
     }
-    else if( SlamConfig::hasLines() )
+    else if( !Config::hasPoints() && Config::hasLines() )
     {
-        if( inl_ratio_ls > SlamConfig::lcInlierRatio() )
+        if( inl_ratio_ls > Config::lcInlierRatio() )
             inl_ratio_condition = true;
     }
-
-
-    //inl_ratio_condition = true;
     if( inl_ratio_condition )
-        return computeRelativePoseRobustGN(lc_points,lc_lines,lc_pt_idx,lc_ls_idx,pose_inc);
+        return computeRelativePoseGN(lc_points,lc_lines,lc_pt_idx,lc_ls_idx,pose_inc);
     else
         return false;
 
@@ -3301,7 +3278,7 @@ bool MapHandler::isLoopClosure( const KeyFrame* kf0, const KeyFrame* kf1, Vector
 
 bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector<LineFeature*> &lc_lines,
                                         vector<Vector4i>      &lc_pt_idx, vector<Vector4i>     &lc_ls_idx,
-                                        Vector6d &pose_inc) const
+                                        Vector6d &pose_inc)
 {
 
     // create GN variables
@@ -3317,7 +3294,7 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
 
     // create GN parameters
     double err, err_prev = 999999999.9;
-    int    max_iters_first = SlamConfig::maxIters(), max_iters = SlamConfig::maxItersRef();
+    int    max_iters_first = Config::maxIters(), max_iters = Config::maxItersRef();
 
     // GN iterations
     //---------------------------------------------------------------------------------------------
@@ -3341,24 +3318,21 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
                 double gy   = P_(1);
                 double gz   = P_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double dx   = err_i(0);
                 double dy   = err_i(1);
                 // jacobian
                 Vector6d J_aux;
                 J_aux << + fgz2 * dx * gz,
-                         + fgz2 * dy * gz,
-                         - fgz2 * ( gx*dx + gy*dy ),
-                         - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
-                         + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
-                         + fgz2 * ( gx*gz*dy - gy*gz*dx );
-                J_aux = J_aux / std::max(SlamConfig::homogTh(),err_i_norm);
+                        + fgz2 * dy * gz,
+                        - fgz2 * ( gx*dx + gy*dy ),
+                        - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
+                        + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
+                        + fgz2 * ( gx*gz*dy - gy*gz*dx );
+                J_aux = J_aux / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
                 double s2 = (*pt_it)->sigma2;
-                //double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
-                w = robustWeightCauchy(err_i_norm) ;
-
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_p += J_aux * J_aux.transpose() * w;
                 g_p += J_aux * err_i_norm * w;
@@ -3387,36 +3361,36 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
                 double gy   = sP_(1);
                 double gz   = sP_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double ds   = err_i(0);
                 double de   = err_i(1);
                 double lx   = l_obs(0);
                 double ly   = l_obs(1);
                 Vector6d Js_aux;
                 Js_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // end point
                 gx   = eP_(0);
                 gy   = eP_(1);
                 gz   = eP_(2);
                 gz2  = gz*gz;
-                fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 Vector6d Je_aux, J_aux;
                 Je_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // jacobian
-                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(SlamConfig::homogTh(),err_i_norm);
+                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
-                w = robustWeightCauchy(err_i_norm) ;
+                double s2 = (*ls_it)->sigma2;
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_l += J_aux * J_aux.transpose() * w;
                 g_l += J_aux * err_i_norm * w;
@@ -3434,10 +3408,10 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
         if( abs(e-err_prev) < numeric_limits<double>::epsilon() || e < numeric_limits<double>::epsilon() )
             break;
         // solve
-        ColPivHouseholderQR<MatrixXd> solver(H);
+        LDLT<MatrixXd> solver(H);
         x_inc = solver.solve( g );
         T_inc = T_inc * inverse_se3( expmap_se3(x_inc) );
-        // if the parameter change is small stop
+        // if the parameter change is small stop (TODO: change with two parameters, one for R and another one for t)
         if( x_inc.norm() < numeric_limits<double>::epsilon() )
             break;
         // update error
@@ -3457,7 +3431,7 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
             // projection error
             Vector2d err_i    = pl_proj - (*pt_it)->pl_obs;
             double s2 = (*pt_it)->sigma2;
-            if( err_i.norm() > sqrt(7.815) )
+            if( err_i.norm() * sqrt(s2) > sqrt(7.815) )
                 (*pt_it)->inlier = false;
         }
     }
@@ -3476,7 +3450,7 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
             err_i(0) = l_obs(0) * spl_proj(0) + l_obs(1) * spl_proj(1) + l_obs(2);
             err_i(1) = l_obs(0) * epl_proj(0) + l_obs(1) * epl_proj(1) + l_obs(2);
             double s2 = sqrt((*ls_it)->sigma2);
-            if( err_i.norm() > sqrt(7.815) )
+            if( err_i.norm() * s2 > sqrt(7.815) )
                 (*ls_it)->inlier = false;
         }
     }
@@ -3484,14 +3458,14 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
     // Check whether it is Loop Closure or not
     //---------------------------------------------------------------------------------------------
     // Residue value
-    bool lc_res = ( e < SlamConfig::lcRes() );
+    bool lc_res = ( e < Config::lcRes() );
 
     // Uncertainty value
     Matrix6d DT_cov;
     DT_cov = H.inverse();
     SelfAdjointEigenSolver<Matrix6d> eigensolver(DT_cov);
     Vector6d DT_cov_eig = eigensolver.eigenvalues();
-    bool lc_unc = ( DT_cov_eig(5) < SlamConfig::lcUnc() );
+    bool lc_unc = ( DT_cov_eig(5) < Config::lcUnc() );
 
     // Ratio of outliers
     int N = lc_points.size() + lc_lines.size(), N_inl = 0;
@@ -3506,19 +3480,26 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
             N_inl++;
     }
     double ratio_inliers = double(N_inl) / double(N);
-    bool lc_inl = ( ratio_inliers > SlamConfig::lcInl() );
+    bool lc_inl = ( ratio_inliers > Config::lcInl() );
     //lc_inl = true;
 
     // Geometry condition
     double t = x_inc.head(3).norm();
     double r = x_inc.tail(3).norm() * 180.f / CV_PI;
-    bool lc_trs = ( t < SlamConfig::lcTrs() );
-    bool lc_rot = ( r < SlamConfig::lcRot() );
+    bool lc_trs = ( t < Config::lcTrs() );
+    bool lc_rot = ( r < Config::lcRot() );
+
+    // Verbose
+    cout << endl << "Residue:       (" << lc_res << ")  " << e << " px" ;
+    cout << endl << "Uncertainty:   (" << lc_unc << ")  " << DT_cov_eig(5) ;
+    cout << endl << "Inliers ratio: (" << lc_inl << ")  " << ratio_inliers << "\t" << N_inl << " " << N ;
+    cout << endl << "Translation:   (" << lc_trs << ")  " << t ;
+    cout << endl << "Rotation:      (" << lc_rot << ")  " << r << endl << endl;
 
     // Decision
     if( lc_res && lc_unc && lc_inl && lc_trs && lc_rot )
     {
-        // erase outliers from lc_pt_idx & lc_ls_idx
+        // erase outliers from      lc_pt_idx & lc_ls_idx
         int iter = 0;
         vector<Vector4i> lc_pt_idx_, lc_ls_idx_;
         vector<PointFeature*> lc_points_;
@@ -3564,8 +3545,8 @@ bool MapHandler::computeRelativePoseGN( vector<PointFeature*> &lc_points, vector
 }
 
 bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, vector<LineFeature*> &lc_lines,
-                                        vector<Vector4i>      &lc_pt_idx, vector<Vector4i>     &lc_ls_idx,
-                                        Vector6d &pose_inc) const
+                                              vector<Vector4i>      &lc_pt_idx, vector<Vector4i>     &lc_ls_idx,
+                                              Vector6d &pose_inc)
 {
 
     // create GN variables
@@ -3581,7 +3562,7 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
 
     // create GN parameters
     double err, err_prev = 999999999.9;
-    int    max_iters_first = SlamConfig::maxIters(), max_iters = SlamConfig::maxItersRef();
+    int    max_iters_first = Config::maxIters(), max_iters = Config::maxItersRef();
 
     // GN iterations
     //---------------------------------------------------------------------------------------------
@@ -3605,22 +3586,21 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
                 double gy   = P_(1);
                 double gz   = P_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double dx   = err_i(0);
                 double dy   = err_i(1);
                 // jacobian
                 Vector6d J_aux;
                 J_aux << + fgz2 * dx * gz,
-                         + fgz2 * dy * gz,
-                         - fgz2 * ( gx*dx + gy*dy ),
-                         - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
-                         + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
-                         + fgz2 * ( gx*gz*dy - gy*gz*dx );
-                J_aux = J_aux / std::max(SlamConfig::homogTh(),err_i_norm);
+                        + fgz2 * dy * gz,
+                        - fgz2 * ( gx*dx + gy*dy ),
+                        - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
+                        + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
+                        + fgz2 * ( gx*gz*dy - gy*gz*dx );
+                J_aux = J_aux / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
                 double s2 = (*pt_it)->sigma2;
-                w = robustWeightCauchy(err_i_norm) ;
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_p += J_aux * J_aux.transpose() * w;
                 g_p += J_aux * err_i_norm * w;
@@ -3649,37 +3629,36 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
                 double gy   = sP_(1);
                 double gz   = sP_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double ds   = err_i(0);
                 double de   = err_i(1);
                 double lx   = l_obs(0);
                 double ly   = l_obs(1);
                 Vector6d Js_aux;
                 Js_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // end point
                 gx   = eP_(0);
                 gy   = eP_(1);
                 gz   = eP_(2);
                 gz2  = gz*gz;
-                fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 Vector6d Je_aux, J_aux;
                 Je_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // jacobian
-                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(SlamConfig::homogTh(),err_i_norm);
+                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
                 double s2 = (*ls_it)->sigma2;
-                w = robustWeightCauchy(err_i_norm) ;
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_l += J_aux * J_aux.transpose() * w;
                 g_l += J_aux * err_i_norm * w;
@@ -3699,11 +3678,11 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
             break;
 
         // solve
-        ColPivHouseholderQR<MatrixXd> solver(H);
+        LDLT<MatrixXd> solver(H);
         x_inc = solver.solve( g );
         T_inc = T_inc * inverse_se3( expmap_se3(x_inc) );
 
-        // if the parameter change is small stop
+        // if the parameter change is small stop (TODO: change with two parameters, one for R and another one for t)
         if( x_inc.norm() < numeric_limits<double>::epsilon() )
             break;
 
@@ -3724,7 +3703,7 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
             // projection error
             Vector2d err_i    = pl_proj - (*pt_it)->pl_obs;
             double s2 = (*pt_it)->sigma2;
-            if( err_i.norm() > sqrt(7.815) )
+            if( err_i.norm() * sqrt(s2) > sqrt(7.815) )
                 (*pt_it)->inlier = false;
         }
     }
@@ -3743,7 +3722,7 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
             err_i(0) = l_obs(0) * spl_proj(0) + l_obs(1) * spl_proj(1) + l_obs(2);
             err_i(1) = l_obs(0) * epl_proj(0) + l_obs(1) * epl_proj(1) + l_obs(2);
             double s2 = sqrt((*ls_it)->sigma2);
-            if( err_i.norm() > sqrt(7.815) )
+            if( err_i.norm() * s2 > sqrt(7.815) )
                 (*ls_it)->inlier = false;
         }
     }
@@ -3770,21 +3749,21 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
                 double gy   = P_(1);
                 double gz   = P_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double dx   = err_i(0);
                 double dy   = err_i(1);
                 // jacobian
                 Vector6d J_aux;
                 J_aux << + fgz2 * dx * gz,
-                         + fgz2 * dy * gz,
-                         - fgz2 * ( gx*dx + gy*dy ),
-                         - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
-                         + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
-                         + fgz2 * ( gx*gz*dy - gy*gz*dx );
-                J_aux = J_aux / std::max(SlamConfig::homogTh(),err_i_norm);
+                        + fgz2 * dy * gz,
+                        - fgz2 * ( gx*dx + gy*dy ),
+                        - fgz2 * ( gx*gy*dx + gy*gy*dy + gz*gz*dy ),
+                        + fgz2 * ( gx*gx*dx + gz*gz*dx + gx*gy*dy ),
+                        + fgz2 * ( gx*gz*dy - gy*gz*dx );
+                J_aux = J_aux / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
-                w = robustWeightCauchy(err_i_norm) ;
+                double s2 = (*pt_it)->sigma2;
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_p += J_aux * J_aux.transpose() * w;
                 g_p += J_aux * err_i_norm * w;
@@ -3813,37 +3792,36 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
                 double gy   = sP_(1);
                 double gz   = sP_(2);
                 double gz2  = gz*gz;
-                double fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                double fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 double ds   = err_i(0);
                 double de   = err_i(1);
                 double lx   = l_obs(0);
                 double ly   = l_obs(1);
                 Vector6d Js_aux;
                 Js_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // end point
                 gx   = eP_(0);
                 gy   = eP_(1);
                 gz   = eP_(2);
                 gz2  = gz*gz;
-                fgz2 = cam->getFx() / std::max(SlamConfig::homogTh(),gz2);
+                fgz2 = cam->getFx() / std::max(Config::homogTh(),gz2);
                 Vector6d Je_aux, J_aux;
                 Je_aux << + fgz2 * lx * gz,
-                          + fgz2 * ly * gz,
-                          - fgz2 * ( gx*lx + gy*ly ),
-                          - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
-                          + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
-                          + fgz2 * ( gx*gz*ly - gy*gz*lx );
+                        + fgz2 * ly * gz,
+                        - fgz2 * ( gx*lx + gy*ly ),
+                        - fgz2 * ( gx*gy*lx + gy*gy*ly + gz*gz*ly ),
+                        + fgz2 * ( gx*gx*lx + gz*gz*lx + gx*gy*ly ),
+                        + fgz2 * ( gx*gz*ly - gy*gz*lx );
                 // jacobian
-                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(SlamConfig::homogTh(),err_i_norm);
+                J_aux = ( Js_aux * ds + Je_aux * de ) / std::max(Config::homogTh(),err_i_norm);
                 // if employing robust cost function
-                double  w = 1.0;
                 double s2 = (*ls_it)->sigma2;
-                w = robustWeightCauchy(err_i_norm) ;
+                double w = 1.0 / ( 1.0 + err_i_norm * err_i_norm * s2 );
                 // update hessian, gradient, and error
                 H_l += J_aux * J_aux.transpose() * w;
                 g_l += J_aux * err_i_norm * w;
@@ -3857,16 +3835,20 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
         e = e_p + e_l;
         // normalize error
         e /= (N_l+N_p);
+
         // if the difference is very small stop
         if( abs(e-err_prev) < numeric_limits<double>::epsilon() || e < numeric_limits<double>::epsilon() )
             break;
+
         // solve
-        ColPivHouseholderQR<MatrixXd> solver(H);
+        LDLT<MatrixXd> solver(H);
         x_inc = solver.solve( g );
         T_inc = T_inc * inverse_se3( expmap_se3(x_inc) );
-        // if the parameter change is small stop
+
+        // if the parameter change is small stop (TODO: change with two parameters, one for R and another one for t)
         if( x_inc.norm() < numeric_limits<double>::epsilon() )
             break;
+
         // update error
         err_prev = e;
     }
@@ -3876,14 +3858,14 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
     // Check whether it is Loop Closure or not
     //---------------------------------------------------------------------------------------------
     // Residue value
-    bool lc_res = ( e < SlamConfig::lcRes() );
+    bool lc_res = ( e < Config::lcRes() );
 
     // Uncertainty value
     Matrix6d DT_cov;
     DT_cov = H.inverse();
     SelfAdjointEigenSolver<Matrix6d> eigensolver(DT_cov);
     Vector6d DT_cov_eig = eigensolver.eigenvalues();
-    bool lc_unc = ( DT_cov_eig(5) < SlamConfig::lcUnc() );
+    bool lc_unc = ( DT_cov_eig(5) < Config::lcUnc() );
 
     // Ratio of outliers
     int N = lc_points.size() + lc_lines.size(), N_inl = 0;
@@ -3898,15 +3880,24 @@ bool MapHandler::computeRelativePoseRobustGN( vector<PointFeature*> &lc_points, 
             N_inl++;
     }
     double ratio_inliers = double(N_inl) / double(N);
-    bool lc_inl = ( ratio_inliers > SlamConfig::lcInl() );
+    bool lc_inl = ( ratio_inliers > Config::lcInl() );
 
     lc_inl = true;
 
     // Geometry condition
     double t = x_inc.head(3).norm();
     double r = x_inc.tail(3).norm() * 180.f / CV_PI;
-    bool lc_trs = ( t < SlamConfig::lcTrs() );
-    bool lc_rot = ( r < SlamConfig::lcRot() );
+    bool lc_trs = ( t < Config::lcTrs() );
+    bool lc_rot = ( r < Config::lcRot() );
+
+    // Verbose
+    cout << endl << "Residue:       (" << lc_res << ")  " << e << " px" ;
+    cout << endl << "Uncertainty:   (" << lc_unc << ")  " << DT_cov_eig(5) ;
+    cout << endl << "Inliers ratio: (" << lc_inl << ")  " << ratio_inliers << "\t" << N_inl << " " << N ;
+    cout << endl << "Translation:   (" << lc_trs << ")  " << t ;
+    cout << endl << "Rotation:      (" << lc_rot << ")  " << r << endl << endl;
+
+    cout << endl << T_inc << endl;
 
     // Decision
     if( lc_res && lc_unc && lc_inl && lc_trs && lc_rot )
@@ -3962,10 +3953,19 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
     // define G2O variables
     g2o::SparseOptimizer optimizer;
     optimizer.setVerbose(true);
+
+
     g2o::BlockSolver_6_3::LinearSolverType* linearSolver;
     linearSolver = new g2o::LinearSolverCholmod<g2o::BlockSolver_6_3::PoseMatrixType>();
     g2o::BlockSolver_6_3* solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
     g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+
+
+/*
+std::unique_ptr<g2o::BlockSolver_6_3::LinearSolverType> linearSolver(new g2o::LinearSolverCholmod<g2o::BlockSolver_6_3::PoseMatrixType>());
+std::unique_ptr<g2o::BlockSolver_6_3> solver_ptr(new g2o::BlockSolver_6_3(std::move(linearSolver)));
+g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(std::move(solver_ptr));
+*/
     solver->setUserLambdaInit(1e-10);
     optimizer.setAlgorithm(solver);
 
@@ -4030,7 +4030,7 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
         for( int j = i+1; j <= kf_curr_idx; j++ )
         {
             if( map_keyframes[i] != NULL && map_keyframes[j] != NULL &&
-                ( full_graph[i][j] >= SlamConfig::minLMEssGraph() || abs(i-j) == 1  ) )
+                    ( full_graph[i][j] >= Config::minLMEssGraph() || abs(i-j) == 1  ) )
             {
                 // kf2kf constraint
                 Matrix4d T_ji_constraint = inverse_se3( map_keyframes[i]->T_kf_w ) * map_keyframes[j]->T_kf_w;
@@ -4041,6 +4041,7 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
                 Vector6d x;
                 x = reverse_se3(logmap_se3(T_ji_constraint) );
                 e_se3->setMeasurement( g2o::SE3Quat::exp(x) );
+                //e_se3->information() = map_keyframes[j]->xcov_kf_w;
                 e_se3->setInformation( Matrix6d::Identity() );
                 optimizer.addEdge( e_se3 );
             }
@@ -4058,6 +4059,7 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
         Vector6d x;
         x = reverse_se3( lc_pose_list[id] );
         e_se3->setMeasurement( g2o::SE3Quat::exp(x) );
+        //e_se3->information() = kf_Tij_cov_constraint[id];
         e_se3->information() = Matrix6d::Identity();
         optimizer.addEdge( e_se3 );
     }
@@ -4066,7 +4068,7 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
     optimizer.initializeOptimization();
     optimizer.computeInitialGuess();
     optimizer.computeActiveErrors();
-    optimizer.optimize(SlamConfig::maxItersPGO());
+    optimizer.optimize(100);
 
     // recover pose and update map
     Matrix4d Tkfw_corr;
@@ -4085,41 +4087,41 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
         Tkfw_corr = Tkfw * inverse_se3( Tkfw_prev );
         for( auto it = map_points_kf_idx.at((*kf_it)).begin(); it != map_points_kf_idx.at((*kf_it)).end(); it++ )
         {
-           if( map_points[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d point3D = map_points[(*it)]->point3D;
-               map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
-               map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_points[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d point3D = map_points[(*it)]->point3D;
+                map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
+                map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
         for( auto it = map_lines_kf_idx.at((*kf_it)).begin(); it != map_lines_kf_idx.at((*kf_it)).end(); it++ )
         {
-           if( map_lines[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
-               Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
-               map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
-               map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
-               map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_lines[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
+                Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
+                map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
+                map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
+                map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
     }
 
@@ -4132,41 +4134,41 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
         // update landmarks
         for( auto it = map_points_kf_idx.at(i).begin(); it != map_points_kf_idx.at(i).end(); it++ )
         {
-           if( map_points[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d point3D = map_points[(*it)]->point3D;
-               map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
-               map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_points[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d point3D = map_points[(*it)]->point3D;
+                map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
+                map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
         for( auto it = map_lines_kf_idx.at(i).begin(); it != map_lines_kf_idx.at(i).end(); it++ )
         {
-           if( map_lines[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
-               Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
-               map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
-               map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
-               map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_lines[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
+                Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
+                map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
+                map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
+                map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
     }
 
@@ -4177,9 +4179,8 @@ bool MapHandler::loopClosureOptimizationEssGraphG2O()
     // fuse local map from both sides of the loop and update graphs
     loopClosureFuseLandmarks();
 
-    lc_state = LC_IDLE;
-
     return true;
+
 }
 
 bool MapHandler::loopClosureOptimizationCovGraphG2O()
@@ -4187,11 +4188,19 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
 
     // define G2O variables
     g2o::SparseOptimizer optimizer;
-    optimizer.setVerbose(false);
+    optimizer.setVerbose(true);
+
     g2o::BlockSolver_6_3::LinearSolverType* linearSolver;
     linearSolver = new g2o::LinearSolverCholmod<g2o::BlockSolver_6_3::PoseMatrixType>();
     g2o::BlockSolver_6_3* solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
     g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+    
+/*
+std::unique_ptr<g2o::BlockSolver_6_3::LinearSolverType> linearSolver(new g2o::LinearSolverCholmod<g2o::BlockSolver_6_3::PoseMatrixType>());
+std::unique_ptr<g2o::BlockSolver_6_3> solver_ptr(new g2o::BlockSolver_6_3(std::move(linearSolver)));
+g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(std::move(solver_ptr));
+*/
+
     solver->setUserLambdaInit(1e-10);
     optimizer.setAlgorithm(solver);
 
@@ -4244,6 +4253,7 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
             else
             {
                 v_se3->setEstimate( g2o::SE3Quat::exp( reverse_se3(map_keyframes[i]->x_kf_w) ) );
+                //if( is_lc_i || i == 0 )
                 if( i == 0 )
                     v_se3->setFixed(true);
             }
@@ -4257,7 +4267,7 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
         for( int j = i+1; j <= kf_curr_idx; j++ )
         {
             if( map_keyframes[i] != NULL && map_keyframes[j] != NULL &&
-                ( full_graph[i][j] >= SlamConfig::minLMEssGraph() || full_graph[i][j] >= SlamConfig::minLMCovGraph() || abs(i-j) == 1  ) )
+                    ( full_graph[i][j] >= Config::minLMEssGraph() || full_graph[i][j] >= Config::minLMCovGraph() || abs(i-j) == 1  ) )
             {
                 // kf2kf constraint
                 Matrix4d T_ji_constraint = inverse_se3( map_keyframes[i]->T_kf_w ) * map_keyframes[j]->T_kf_w;
@@ -4268,6 +4278,7 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
                 Vector6d x;
                 x = reverse_se3(logmap_se3(T_ji_constraint) );
                 e_se3->setMeasurement( g2o::SE3Quat::exp(x) );
+                //e_se3->information() = map_keyframes[j]->xcov_kf_w;
                 e_se3->setInformation( Matrix6d::Identity() );
                 optimizer.addEdge( e_se3 );
             }
@@ -4285,6 +4296,7 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
         Vector6d x;
         x = reverse_se3( lc_pose_list[id] );
         e_se3->setMeasurement( g2o::SE3Quat::exp(x) );
+        //e_se3->information() = kf_Tij_cov_constraint[id];
         e_se3->information() = Matrix6d::Identity();
         optimizer.addEdge( e_se3 );
     }
@@ -4293,7 +4305,7 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
     optimizer.initializeOptimization();
     optimizer.computeInitialGuess();
     optimizer.computeActiveErrors();
-    optimizer.optimize(SlamConfig::maxItersPGO());
+    optimizer.optimize(100);
 
     // recover pose and update map
     Matrix4d Tkfw_corr;
@@ -4312,41 +4324,41 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
         Tkfw_corr = Tkfw * inverse_se3( Tkfw_prev );
         for( auto it = map_points_kf_idx.at((*kf_it)).begin(); it != map_points_kf_idx.at((*kf_it)).end(); it++ )
         {
-           if( map_points[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d point3D = map_points[(*it)]->point3D;
-               map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
-               map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_points[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d point3D = map_points[(*it)]->point3D;
+                map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
+                map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
         for( auto it = map_lines_kf_idx.at((*kf_it)).begin(); it != map_lines_kf_idx.at((*kf_it)).end(); it++ )
         {
-           if( map_lines[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
-               Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
-               map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
-               map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
-               map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_lines[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
+                Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
+                map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
+                map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
+                map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
     }
 
@@ -4359,41 +4371,41 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
         // update landmarks
         for( auto it = map_points_kf_idx.at(i).begin(); it != map_points_kf_idx.at(i).end(); it++ )
         {
-           if( map_points[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d point3D = map_points[(*it)]->point3D;
-               map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
-               map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_points[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d point3D = map_points[(*it)]->point3D;
+                map_points[(*it)]->point3D = Tkfw_corr.block(0,0,3,3) * point3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_points[(*it)]->med_obs_dir;
+                map_points[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_points[(*it)]->dir_list.begin(); dir_it != map_points[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
         for( auto it = map_lines_kf_idx.at(i).begin(); it != map_lines_kf_idx.at(i).end(); it++ )
         {
-           if( map_lines[(*it)] != NULL )
-           {
-               // update 3D position
-               Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
-               Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
-               map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
-               map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
-               // update direction of observation
-               Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
-               map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
-               // update direction of each observation
-               for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
-               {
-                   Vector3d dir_list_ = (*dir_it);
-                   (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
-               }
-           }
+            if( map_lines[(*it)] != NULL )
+            {
+                // update 3D position
+                Vector3d sP3D = map_lines[(*it)]->line3D.head(3);
+                Vector3d eP3D = map_lines[(*it)]->line3D.tail(3);
+                map_lines[(*it)]->line3D.head(3) = Tkfw_corr.block(0,0,3,3) * sP3D + Tkfw_corr.block(0,3,3,1);
+                map_lines[(*it)]->line3D.tail(3) = Tkfw_corr.block(0,0,3,3) * eP3D + Tkfw_corr.block(0,3,3,1);
+                // update direction of observation
+                Vector3d obs_dir = map_lines[(*it)]->med_obs_dir;
+                map_lines[(*it)]->med_obs_dir = Tkfw_corr.block(0,0,3,3) * obs_dir + Tkfw_corr.block(0,3,3,1);
+                // [CHECK] update direction of each observation
+                for( auto dir_it = map_lines[(*it)]->dir_list.begin(); dir_it != map_lines[(*it)]->dir_list.end(); dir_it++)
+                {
+                    Vector3d dir_list_ = (*dir_it);
+                    (*dir_it) = Tkfw_corr.block(0,0,3,3) * dir_list_ + Tkfw_corr.block(0,3,3,1);
+                }
+            }
         }
     }
 
@@ -4404,9 +4416,8 @@ bool MapHandler::loopClosureOptimizationCovGraphG2O()
     // fuse local map from both sides of the loop and update graphs
     loopClosureFuseLandmarks();
 
-    lc_state = LC_IDLE;
-
     return true;
+
 }
 
 void MapHandler::loopClosureFuseLandmarks()
@@ -4420,6 +4431,8 @@ void MapHandler::loopClosureFuseLandmarks()
         {
             int kf_prev_idx = lc_idx_list[lc_idx](0);
             int kf_curr_idx = lc_idx_list[lc_idx](1);
+            /*if( map_keyframes[kf_prev_idx] == NULL || map_keyframes[kf_curr_idx] == NULL )
+                continue;*/
             for( auto lm_it = (*idx_it).begin(); lm_it != (*idx_it).end(); lm_it++ )
             {
                 // grab indices
@@ -4471,12 +4484,14 @@ void MapHandler::loopClosureFuseLandmarks()
                         // create new 3D landmark with the observation from previous KF
                         Matrix4d Tfw = ( map_keyframes[kf_prev_idx]->T_kf_w );
                         Vector3d P3d = Tfw.block(0,0,3,3) * map_keyframes[kf_prev_idx]->stereo_frame->stereo_pt[lm_ldx0]->P + Tfw.col(3).head(3);
+                        //Vector3d dir = map_keyframes[kf_prev_idx]->stereo_frame->stereo_pt[lm_ldx0]->P / map_keyframes[kf_prev_idx]->stereo_frame->stereo_pt[lm_ldx0]->P.norm();
                         Vector3d dir = P3d / P3d.norm();
                         MapPoint* map_point = new MapPoint(max_pt_idx,P3d,map_keyframes[kf_prev_idx]->stereo_frame->pdesc_l.row(lm_ldx0),map_keyframes[kf_prev_idx]->kf_idx,map_keyframes[kf_prev_idx]->stereo_frame->stereo_pt[lm_ldx0]->pl,dir);
                         // add new 3D landmark to kf_idx where it was first observed
                         map_points_kf_idx.at( kf_prev_idx ).push_back( max_pt_idx );
                         // add observation of the 3D landmark from current KF
                         P3d = map_keyframes[kf_curr_idx]->T_kf_w.block(0,0,3,3) *  map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1]->P + map_keyframes[kf_curr_idx]->T_kf_w.col(3).head(3);
+                        //dir = map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1]->P / map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1]->P.norm();
                         dir = P3d / P3d.norm();
                         map_point->addMapPointObservation(map_keyframes[kf_curr_idx]->stereo_frame->pdesc_l.row(lm_ldx1),map_keyframes[kf_curr_idx]->kf_idx,map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1]->pl,dir);
                         // add 3D landmark to map
@@ -4491,7 +4506,7 @@ void MapHandler::loopClosureFuseLandmarks()
                 if( lm_idx0 != -1 && lm_idx1 != -1 )
                 {
                     if( map_points[lm_idx0] != NULL && map_points[lm_idx1] != NULL
-                        && map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1] != NULL )
+                            && map_keyframes[kf_curr_idx]->stereo_frame->stereo_pt[lm_ldx1] != NULL )
                     {
                         int Nobs_lm_prev = map_points[lm_idx0]->kf_obs_list.size();
                         // fuse LMs while updating the full graph
@@ -4528,8 +4543,7 @@ void MapHandler::loopClosureFuseLandmarks()
                             }
                         }
                         // erase old landmark
-                        delete map_points[lm_idx1];
-                        map_points[lm_idx1] = nullptr;
+                        map_points[lm_idx1] = NULL;
                     }
                 }
             }
@@ -4544,6 +4558,8 @@ void MapHandler::loopClosureFuseLandmarks()
         {
             int kf_prev_idx = lc_idx_list[lc_idx](0);
             int kf_curr_idx = lc_idx_list[lc_idx](1);
+            /*if( map_keyframes[kf_prev_idx] == NULL || map_keyframes[kf_curr_idx] == NULL )
+                continue;*/
             for( auto lm_it = (*idx_it).begin(); lm_it != (*idx_it).end(); lm_it++ )
             {
                 // grab indices
@@ -4551,14 +4567,18 @@ void MapHandler::loopClosureFuseLandmarks()
                 int lm_ldx0  = (*lm_it)(1); // lr_qdx
                 int lm_idx1  = (*lm_it)(2);
                 int lm_ldx1  = (*lm_it)(3); // lr_tdx
+                cout << endl << (*lm_it).transpose() ;
                 // if the LM exists just once, add observation
                 if( lm_idx0 == -1 && lm_idx1 != -1 )
                 {
+
+                    cout << "\t" << map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls.size();
+
                     if( map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0] != NULL && map_lines[lm_idx1] != NULL )
                     {
                         map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->idx = lm_idx1;
                         Vector3d dir  = ( map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->sP + map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->eP )
-                                      / ( map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->sP + map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->eP ).norm();
+                                / ( map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->sP + map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->eP ).norm();
                         Vector4d pts;
                         pts.head(2) = map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->spl_obs;
                         pts.tail(2) = map_keyframes[kf_prev_idx]->stereo_frame->stereo_ls[lm_ldx0]->epl_obs;
@@ -4578,6 +4598,9 @@ void MapHandler::loopClosureFuseLandmarks()
                 {
                     if( map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1] != NULL && map_lines[lm_idx0] != NULL )
                     {
+
+                        cout << "\t" << map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls.size();
+
                         map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1]->idx = lm_idx0;
                         Vector3d dir  = (map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1]->sP + map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1]->eP)
                                 / (map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1]->sP+map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1]->eP).norm();
@@ -4638,7 +4661,7 @@ void MapHandler::loopClosureFuseLandmarks()
                 if( lm_idx0 != -1 && lm_idx1 != -1 )
                 {
                     if( map_lines[lm_idx0] != NULL && map_lines[lm_idx1] != NULL
-                        && map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1] != NULL )
+                            && map_keyframes[kf_curr_idx]->stereo_frame->stereo_ls[lm_ldx1] != NULL )
                     {
                         int Nobs_lm_prev = map_lines[lm_idx0]->kf_obs_list.size();
                         // fuse LMs while updating the full graph
@@ -4676,22 +4699,13 @@ void MapHandler::loopClosureFuseLandmarks()
                             }
                         }
                         // erase old landmark
-                        delete map_lines[lm_idx1];
-                        map_lines[lm_idx1] = nullptr;
+                        map_lines[lm_idx1] = NULL;
                     }
                 }
             }
         }
     }
 
-}
-
-void MapHandler::print_msg(const std::string &msg) {
-
-    {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        cout << msg << endl;
-    }
 }
 
 }
