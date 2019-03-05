@@ -3,8 +3,8 @@
 Good line cutting is an enhancement module that is designed for line-assisted VSLAM, such as PL-SLAM.  The primary objective of good line cutting is to pre-condition line-assisted pose optimization, therefore improving the robustness of optimization under 3D line triangulation error.
 
 <figure>
-  <img src="https://github.com/YipuZhao/GF_ORB_SLAM/blob/master/batch_script/RMSE_vs_Latency_EuRoC.png" alt="EuRoC" style="width:100%">
-  <figcaption>Performance vs. latency evaluation on EuRoC monocular sequences (left-cam only)</figcaption>
+  <img src="https://github.com/YipuZhao/GF_PL_SLAM/blob/master/batch_script/intuition.png" alt="Intuition" style="width:100%">
+  <figcaption>Intuition of good line cutting</figcaption>
 </figure>
 
 ## Build & Run
