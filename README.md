@@ -7,6 +7,8 @@ Good line cutting is an enhancement module that is designed for line-assisted VS
   <figcaption>Intuition of good line cutting</figcaption>
 </figure>
 
+[![Example Run of GF-PL-SLAM](https://img.youtube.com/vi/YAq5uzDtSXE/0.jpg)](https://youtu.be/YAq5uzDtSXE)
+
 ## Build & Run
 
 This repo is an integration of good line cutting to stereo PL-SLAM.  When tested on multiple challenging scenarios that point feature may fail, GF-PL-SLAM has better performance than PL-SLAM baseline and other state-of-the-art stereo SLAM systems.
