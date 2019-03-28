@@ -27,7 +27,10 @@ typedef Matrix<double,6,6> Matrix6d;
 typedef Matrix<double,6,1> Vector6d;
 
 
+// enable visualization modules of PL-SLAM
 #define DO_VIZ
+
+// apply box filter to input image, to simulate motion blur
 // #define SIMU_MOTION_BLUR
 
 

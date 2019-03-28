@@ -9,7 +9,7 @@ LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
 # set( OpenCV_DIR /opt/ros/kinetic/share/OpenCV-3.3.1-dev )
 # find_package(OpenCV 3 REQUIRED)
 set( OpenCV_DIR /opt/opencv3/share/OpenCV )
-find_package(OpenCV 3 REQUIRED)
+find_package(OpenCV 3.4.0 REQUIRED)
 MESSAGE("OpenCV include dir: " ${OpenCV_INCLUDE_DIRS})
 
 find_package(Boost    REQUIRED COMPONENTS thread system filesystem)

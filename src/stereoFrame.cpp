@@ -320,8 +320,12 @@ void StereoFrame::extractInitialStereoFeatures( const int fast_th )
                     Vector3d sP_; sP_ = cam->backProjection( sp_l(0), sp_l(1), disp_s);
                     Vector3d eP_; eP_ = cam->backProjection( ep_l(0), ep_l(1), disp_e);
                     double angle_l = lines_l[lr_qdx].angle;
+
+                    // cout << "are we ok here?" << endl;
                     stereo_ls.push_back( new LineFeature(Vector2d(sp_l(0),sp_l(1)),disp_s,sP_,Vector2d(ep_l(0),ep_l(1)),
                                                          disp_e,eP_,le_l,angle_l,ls_idx, lines_l[lr_qdx].octave) );
+                    // cout << "we are ok!" << endl;
+
                     //
                     image_ls_r.push_back(lines_r[lr_tdx]);
                     image_ls_l.push_back(lines_l[lr_qdx]);
