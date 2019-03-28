@@ -43,6 +43,15 @@ If you use GF-PL-SLAM in an academic work, please cite:
 	  year={2018}
 	}
 
+It's nice to include Ruben's original PL-SLAM implementation as well:
+
+	@article{gomez2017pl,
+      title   = {{PL-SLAM: a Stereo SLAM System through the Combination of Points and Line Segments}},
+      author  = {Gomez-Ojeda, Ruben and Zuñiga-Noël, David and Moreno, Francisco-Angel and Scaramuzza, Davide and Gonzalez-Jimenez, Javier},
+      journal = {arXiv preprint arXiv:1705.09479},
+      year    = {2017}
+	}
+
 ---
 
 
@@ -63,7 +72,7 @@ If you use PL-SLAM in your research work, please cite:
       author  = {Gomez-Ojeda, Ruben and Zuñiga-Noël, David and Moreno, Francisco-Angel and Scaramuzza, Davide and Gonzalez-Jimenez, Javier},
       journal = {arXiv preprint arXiv:1705.09479},
       year    = {2017}
-}
+	}
 
 The pdf file can be found at [https://arxiv.org/abs/1705.09479](https://arxiv.org/abs/1705.09479).
 
