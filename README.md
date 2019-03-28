@@ -2,7 +2,10 @@
 
 Good line cutting is an enhancement module that is designed for line-assisted VSLAM, such as PL-SLAM.  The primary objective of good line cutting is to pre-condition line-assisted pose optimization, therefore improving the robustness of optimization under 3D line triangulation error.
 
-[![Example Run of GF-PL-SLAM](https://img.youtube.com/vi/YAq5uzDtSXE/0.jpg)](https://youtu.be/YAq5uzDtSXE)
+<figure>
+  <img src="https://github.com/YipuZhao/GF_ORB_SLAM/blob/master/batch_script/RMSE_vs_Latency_EuRoC.png" alt="EuRoC" style="width:100%">
+  <figcaption>Performance vs. latency evaluation on EuRoC monocular sequences (left-cam only)</figcaption>
+</figure>
 
 ## Build & Run
 
@@ -22,7 +25,7 @@ Build the GF-PL-SLAM itself
 
 With the head version of g2o, it's possible to prompt error when building GF-PL-SLAM.  When getting error like "no matching function for BlockSolver XXX", refer to the fix at 
 
-	https://github.com/rubengooj/pl-slam/issues/29#issuecomment-437773067
+	https://github.com/rubengooj/pl-slam/issues/29
 
 To run GF-PL-SLAM, please refer to some example batch evaluation scripts at folder 
 

@@ -19,8 +19,10 @@ find_package(Boost    REQUIRED COMPONENTS thread system filesystem)
 SET( EIGEN3_INCLUDE_DIR /usr/include/eigen3 )
 MESSAGE("EIGEN include dir: " ${EIGEN3_INCLUDE_DIR})
 
-set( G2O_DIR /opt/g2o/lib/g2o/ )
+set( G2O_ROOT /opt/g2o )
 find_package(G2O      REQUIRED)
+#set( G2O_INCLUDE_DIR /opt/g2o/include/ )
+#set( G2O_LIBRARIES g2o_cli g2o_ext_freeglut_minimal g2o_simulator g2o_solver_slam2d_linear g2o_types_icp g2o_types_slam2d g2o_core g2o_interface g2o_solver_csparse g2o_solver_structure_only g2o_types_sba g2o_types_slam3d g2o_csparse_extension g2o_opengl_helper g2o_solver_dense g2o_stuff g2o_types_sclam2d g2o_parser g2o_solver_pcg g2o_types_data g2o_types_sim3 cxsparse g2o_ext_csparse cholmod )
 MESSAGE("G2O include dir: " ${G2O_INCLUDE_DIR})
 MESSAGE("G2O libraries " ${G2O_LIBRARIES})
 
@@ -85,7 +87,10 @@ list(APPEND LINK_LIBS
     ${OpenCV_LIBS}
     ${Boost_LIBRARIES}
     cholmod
-    ${G2O_LIBRARIES}
+    ${G2O_CORE_LIBRARY}
+    ${G2O_SOLVER_EIGEN}
+    ${G2O_TYPES_DATA}
+    ${G2O_TYPES_SLAM3D}
     ${PROJECT_SOURCE_DIR}/3rdparty/DBoW2/lib/libDBoW2.so
     ${PROJECT_SOURCE_DIR}/3rdparty/line_descriptor/lib/liblinedesc.so
     )

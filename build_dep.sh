@@ -9,6 +9,9 @@ sudo apt-get install libboost-dev
 # YAML
 sudo apt-get install libyaml-cpp-dev
 
+# SuiteSparse
+sudo apt-get install libsuitesparse-dev
+
 # g2o
 cd ${DEPENDENCIES_DIR}
 git clone https://github.com/RainerKuemmerle/g2o.git
@@ -34,6 +37,9 @@ cd build
 cmake .. -DCMAKE_INSTALL_PREFIX:PATH="/opt/opencv3" -DBUILD_TBB:BOOL="1" -DWITH_TBB:BOOL="1" -DCMAKE_BUILD_TYPE:STRING="Release" -DWITH_OPENMP:BOOL="1"  -DBUILD_opencv_gpu:BOOL="1" -DOPENCV_EXTRA_MODULES_PATH:PATH=${DEPENDENCIES_DIR}/opencv_contrib-3.4.1/modules -DBUILD_opencv_cudaobjdetect:BOOL="1" -DWITH_CUFFT:BOOL="1" -DBUILD_opencv_cudaimgproc:BOOL="1" -DBUILD_opencv_cudastereo:BOOL="1" -DBUILD_opencv_cudaoptflow:BOOL="1" -DBUILD_opencv_cudabgsegm:BOOL="1" -DBUILD_opencv_cudaarithm:BOOL="1" -DWITH_CUDA:BOOL="1" -DOPENCV_ENABLE_NONFREE:BOOL="1" -DBUILD_opencv_cudacodec:BOOL="1" -DWITH_CUBLAS:BOOL="1" -DBUILD_opencv_cudawarping:BOOL="1" -DBUILD_opencv_cudafilters:BOOL="1" -DCUDA_64_BIT_DEVICE_CODE:BOOL="1" -DBUILD_opencv_cudafeatures2d:BOOL="1" -DBUILD_opencv_cudalegacy:BOOL="1" 
 make -j
 sudo make install
+
+# WxWidget
+sudo apt-get install wx3.0-headers libwxgtk3.0-dev
 
 # MRPT (viz only)
 cd ${DEPENDENCIES_DIR}
