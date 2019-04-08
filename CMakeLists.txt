@@ -163,7 +163,7 @@ endif(HAS_MRPT)
 
 #add_executable( testCut
 #    ${SOURCEFILES}
-##    ./test/testCut_1.cpp
+##    ./test/testCut.cpp
 #    ./test/main.cpp
 #    )
 #target_link_libraries( testCut
