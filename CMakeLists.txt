@@ -6,10 +6,10 @@ MESSAGE("CMake Build Type: "  ${CMAKE_BUILD_TYPE})
 
 LIST(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake_modules)
 
-# set( OpenCV_DIR /opt/ros/kinetic/share/OpenCV-3.3.1-dev )
-# find_package(OpenCV 3 REQUIRED)
-set( OpenCV_DIR /opt/opencv3/share/OpenCV )
-find_package(OpenCV 3.4.0 REQUIRED)
+set( OpenCV_DIR /opt/ros/kinetic/share/OpenCV-3.3.1-dev )
+find_package(OpenCV 3 REQUIRED)
+# set( OpenCV_DIR /opt/opencv3/share/OpenCV )
+# find_package(OpenCV 3.4.0 REQUIRED)
 MESSAGE("OpenCV include dir: " ${OpenCV_INCLUDE_DIRS})
 
 find_package(Boost    REQUIRED COMPONENTS thread system filesystem)
@@ -36,6 +36,7 @@ include_directories(${OpenCV2_INCLUDE_DIRS})
 
 set(DEFAULT_HAS_MRPT ON)
 set(HAS_MRPT ${DEFAULT_HAS_MRPT} CACHE BOOL "Build the PointGrey Bumblebee2 SVO application that employs the MRPT library")
+#set(HAS_MRPT OFF)
 
 SET(BUILD_SHARED_LIBS ON)
 SET(CMAKE_MODULE_PATH $ENV{CMAKE_MODULE_PATH})
@@ -72,7 +73,7 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)
 include_directories(
     include
     ${YAML_CPP_INCLUDE_DIRS}
-    ${Eigen3_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
     ${PROJECT_SOURCE_DIR}/3rdparty/DBoW2/DBoW2/
@@ -150,8 +151,8 @@ if(HAS_MRPT)
     add_executable       ( plstvo_dataset app/plstvo_dataset.cpp )
     target_link_libraries( plstvo_dataset plslam )
     #
-    add_executable       ( plstvo_mod     app/plstvo_mod.cpp )
-    target_link_libraries( plstvo_mod     plslam )
+    #    add_executable       ( plstvo_mod     app/plstvo_mod.cpp )
+    #    target_link_libraries( plstvo_mod     plslam )
     add_executable       ( plslam_mod     app/plslam_mod.cpp )
     target_link_libraries( plslam_mod     plslam )
 endif(HAS_MRPT)
@@ -163,7 +164,7 @@ endif(HAS_MRPT)
 
 #add_executable( testCut
 #    ${SOURCEFILES}
-##    ./test/testCut.cpp
+##    ./test/testCut_1.cpp
 #    ./test/main.cpp
 #    )
 #target_link_libraries( testCut

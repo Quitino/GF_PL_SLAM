@@ -8,3 +8,4 @@ build/*
 simu/line_cut/*
 config/aux/*
 CMakeLists.txt.user
+.vscode/

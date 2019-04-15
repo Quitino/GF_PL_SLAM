@@ -2,97 +2,108 @@
 
 double get3DLineIntersection(const Vector3d line_1_sp, const Vector3d line_1_ep,
                              const Vector3d line_2_sp, const Vector3d line_2_ep,
-                             Vector3d &ipt_1, Vector3d &ipt_2) {
+                             Vector3d &ipt_1, Vector3d &ipt_2)
+{
 
-    Vector3d   u = line_1_ep - line_1_sp;
-    Vector3d   v = line_2_ep - line_2_sp;
-    Vector3d   w = line_1_sp - line_2_sp;
+    Vector3d u = line_1_ep - line_1_sp;
+    Vector3d v = line_2_ep - line_2_sp;
+    Vector3d w = line_1_sp - line_2_sp;
 
-    double    a = u.dot(u);         // always >= 0
-    double    b = u.dot(v);
-    double    c = v.dot(v);         // always >= 0
-    double    d = u.dot(w);
-    double    e = v.dot(w);
-    double    D = a*c - b*b;        // always >= 0
-    double    sc, tc;
+    double a = u.dot(u); // always >= 0
+    double b = u.dot(v);
+    double c = v.dot(v); // always >= 0
+    double d = u.dot(w);
+    double e = v.dot(w);
+    double D = a * c - b * b; // always >= 0
+    double sc, tc;
 
     // compute the line parameters of the two closest points
-    if (D < 0.0001) {          // the lines are almost parallel
+    if (D < 0.0001)
+    { // the lines are almost parallel
         sc = 0.0;
-        tc = (b>c ? d/b : e/c);    // use the largest denominator
+        tc = (b > c ? d / b : e / c); // use the largest denominator
     }
-    else {
-        sc = (b*e - c*d) / D;
-        tc = (a*e - b*d) / D;
+    else
+    {
+        sc = (b * e - c * d) / D;
+        tc = (a * e - b * d) / D;
     }
 
     ipt_1 = line_1_sp + sc * u;
     ipt_2 = line_2_sp + tc * v;
 
     // get the difference of the two closest points
-    Vector3d   dP = w + (sc * u) - (tc * v);  // =  lz[0](sc) - lz[1](tc)
-    return dP.norm();   // return the closest distance
+    Vector3d dP = w + (sc * u) - (tc * v); // =  lz[0](sc) - lz[1](tc)
+    return dP.norm();                      // return the closest distance
 }
 
-void getEigenValue(const Matrix<double, 6, 6> & mat66,
-                   vector<double>& ev) {
+void getEigenValue(const Matrix<double, 6, 6> &mat66,
+                   vector<double> &ev)
+{
 
     EigenSolver<MatrixXd> es(mat66, false);
     int en = es.eigenvalues().rows();
 
     ev.clear();
-    for (int i=0; i<en; ++i) {
-        ev.push_back(es.eigenvalues()(i,0).real());
+    for (int i = 0; i < en; ++i)
+    {
+        ev.push_back(es.eigenvalues()(i, 0).real());
     }
     std::sort(ev.begin(), ev.end());
     std::reverse(ev.begin(), ev.end());
 
-    return ;
+    return;
 }
 
-double getMinEigenValue(const Matrix<double, 6, 6> & mat66) {
+double getMinEigenValue(const Matrix<double, 6, 6> &mat66)
+{
 
     EigenSolver<MatrixXd> es(mat66, false);
     int en = es.eigenvalues().rows();
 
     vector<double> ev;
     ev.clear();
-    for (int i=0; i<en; ++i) {
-        ev.push_back(es.eigenvalues()(i,0).real());
+    for (int i = 0; i < en; ++i)
+    {
+        ev.push_back(es.eigenvalues()(i, 0).real());
     }
     std::sort(ev.begin(), ev.end());
 
     return ev[0];
 }
 
-double getLogVolume(const Matrix<double, 6, 6> & mat66) {
+double getLogVolume(const Matrix<double, 6, 6> &mat66)
+{
 
     EigenSolver<MatrixXd> es(mat66, false);
     int en = es.eigenvalues().rows();
 
     double vol = 1.0;
-    for (int i=0; i<en; ++i) {
-        vol *= es.eigenvalues()(i,0).real();
+    for (int i = 0; i < en; ++i)
+    {
+        vol *= es.eigenvalues()(i, 0).real();
     }
 
     return std::log(vol);
 }
 
-
-double getDiagonalProduct(const Matrix<double, 6, 6> & mat66) {
+double getDiagonalProduct(const Matrix<double, 6, 6> &mat66)
+{
     double prod_ = 1.0;
-    for (int i=0; i<6; ++i) {
-        prod_ *= mat66(i,i);
+    for (int i = 0; i < 6; ++i)
+    {
+        prod_ *= mat66(i, i);
     }
 
     return prod_;
 }
 
-
-double getDiagonalNorm(const Matrix<double, 6, 6> & mat66) {
+double getDiagonalNorm(const Matrix<double, 6, 6> &mat66)
+{
     Matrix<double, 6, 1> dvec;
-    for (int i=0; i<6; ++i) {
-        dvec(i, 0) = sqrt(mat66(i,i));
+    for (int i = 0; i < 6; ++i)
+    {
+        dvec(i, 0) = sqrt(mat66(i, i));
     }
 
     return dvec.norm();
@@ -101,11 +112,12 @@ double getDiagonalNorm(const Matrix<double, 6, 6> & mat66) {
 // the main code is stole from kraken side: LineJacobian.inl
 // it is copied herer for assessing contribution of points along the line towards pose optimization
 // the rationale being that, there are some local maximum positions that support line cutting strategy
-void point2LineJacobian(const Matrix<double, 6, 1> & rigframe_T_world,
-                        const Matrix<double, 6, 1> & camera_T_rigframe,
-                        const Vector3d & lz,
-                        const Vector3d & pt3D,
-                        Matrix<double, 6, 1> & jac_p2l) {
+void point2LineJacobian(const Matrix<double, 6, 1> &rigframe_T_world,
+                        const Matrix<double, 6, 1> &camera_T_rigframe,
+                        const Vector3d &lz,
+                        const Vector3d &pt3D,
+                        Matrix<double, 6, 1> &jac_p2l)
+{
 
     // const double cam_qw( camera_T_rigframe.rotation.w );
     double cam_qx = camera_T_rigframe[0];
@@ -306,28 +318,27 @@ void point2LineJacobian(const Matrix<double, 6, 1> & rigframe_T_world,
     x[178] = -x[171] * x[99] + x[175] * x[91];
 
     jac_p2l[0] =
-            x[106] * (lz[0] * (-pt3D[1] * x[33] - pt3D[2] * x[36] + x[39] * x[40]) +
-            lz[1] * (-pt3D[0] * x[41] - pt3D[2] * x[45] + x[47] * x[48]) - x[105] * x[54] - x[54] * x[94]);
+        x[106] * (lz[0] * (-pt3D[1] * x[33] - pt3D[2] * x[36] + x[39] * x[40]) +
+                  lz[1] * (-pt3D[0] * x[41] - pt3D[2] * x[45] + x[47] * x[48]) - x[105] * x[54] - x[54] * x[94]);
     jac_p2l[1] = x[106] * (lz[0] * (-pt3D[1] * x[118] + pt3D[2] * x[114] - x[121] * x[40]) +
-            lz[1] * (-pt3D[0] * x[126] + pt3D[2] * x[125] - x[128] * x[48]) - x[105] * x[132] -
-            x[132] * x[94]);
+                           lz[1] * (-pt3D[0] * x[126] + pt3D[2] * x[125] - x[128] * x[48]) - x[105] * x[132] -
+                           x[132] * x[94]);
     jac_p2l[2] = x[106] * (lz[0] * (-pt3D[1] * x[140] - pt3D[2] * x[144] + x[147] * x[40]) +
-            lz[1] * (-pt3D[0] * x[148] - pt3D[2] * x[152] + x[154] * x[48]) - x[105] * x[158] -
-            x[158] * x[94]);
+                           lz[1] * (-pt3D[0] * x[148] - pt3D[2] * x[152] + x[154] * x[48]) - x[105] * x[158] -
+                           x[158] * x[94]);
     jac_p2l[3] = x[161] * (-x[164] * x[69] - x[167] * x[168] + x[172]);
     jac_p2l[4] = x[161] * (-x[164] * x[74] - x[167] * x[173] + x[176]);
     jac_p2l[5] = x[78] * (x[105] * x[177] + x[177] * x[94] + x[178]);
-
 }
 
-
-void pointPair2LineJacobian(const Matrix<double, 6, 1> & rigframe_T_world,
-                            const Matrix<double, 6, 1> & camera_T_rigframe,
-                            const Vector3d & lz,
-                            const Vector3d & spt3D,
-                            const Vector3d & ept3D,
-                            Matrix<double, 6, 1> & jac_spt2l,
-                            Matrix<double, 6, 1> & jac_ept2l) {
+void pointPair2LineJacobian(const Matrix<double, 6, 1> &rigframe_T_world,
+                            const Matrix<double, 6, 1> &camera_T_rigframe,
+                            const Vector3d &lz,
+                            const Vector3d &spt3D,
+                            const Vector3d &ept3D,
+                            Matrix<double, 6, 1> &jac_spt2l,
+                            Matrix<double, 6, 1> &jac_ept2l)
+{
 
     // const double cam_qw( camera_T_rigframe.rotation.w );
     double cam_qx = camera_T_rigframe[0];
@@ -554,27 +565,27 @@ void pointPair2LineJacobian(const Matrix<double, 6, 1> & rigframe_T_world,
     x[194] = x[192] * (-x[165] * x[181] + x[166] * x[179] + x[187]);
 
     jac_spt2l[0] =
-            x[106] * (l1 * (-sp1 * x[33] - sp2 * x[36] + x[39] * x[40]) +
-            l2 * (-sp0 * x[41] - sp2 * x[45] + x[47] * x[48]) - x[105] * x[54] - x[54] * x[94]);
+        x[106] * (l1 * (-sp1 * x[33] - sp2 * x[36] + x[39] * x[40]) +
+                  l2 * (-sp0 * x[41] - sp2 * x[45] + x[47] * x[48]) - x[105] * x[54] - x[54] * x[94]);
     jac_spt2l[1] = x[106] * (l1 * (-sp1 * x[118] + sp2 * x[114] - x[121] * x[40]) +
-            l2 * (-sp0 * x[126] + sp2 * x[125] - x[128] * x[48]) - x[105] * x[132] -
-            x[132] * x[94]);
+                             l2 * (-sp0 * x[126] + sp2 * x[125] - x[128] * x[48]) - x[105] * x[132] -
+                             x[132] * x[94]);
     jac_spt2l[2] = x[106] * (l1 * (-sp1 * x[140] - sp2 * x[144] + x[147] * x[40]) +
-            l2 * (-sp0 * x[148] - sp2 * x[152] + x[154] * x[48]) - x[105] * x[158] -
-            x[158] * x[94]);
+                             l2 * (-sp0 * x[148] - sp2 * x[152] + x[154] * x[48]) - x[105] * x[158] -
+                             x[158] * x[94]);
     jac_spt2l[3] = x[161] * (-x[164] * x[69] - x[167] * x[168] + x[172]);
     jac_spt2l[4] = x[161] * (-x[164] * x[74] - x[167] * x[173] + x[176]);
     jac_spt2l[5] = x[78] * (x[105] * x[177] + x[177] * x[94] + x[178]);
     //
     jac_ept2l[0] = x[189] * (l1 * (-ep1 * x[33] - ep2 * x[36] + x[179] * x[39]) +
-            l2 * (-ep0 * x[41] - ep2 * x[45] + x[180] * x[47]) - x[182] * x[186] -
-            x[182] * x[188]);
+                             l2 * (-ep0 * x[41] - ep2 * x[45] + x[180] * x[47]) - x[182] * x[186] -
+                             x[182] * x[188]);
     jac_ept2l[1] = x[189] * (l1 * (-ep1 * x[118] + ep2 * x[114] - x[121] * x[179]) +
-            l2 * (-ep0 * x[126] + ep2 * x[125] - x[128] * x[180]) - x[186] * x[190] -
-            x[188] * x[190]);
+                             l2 * (-ep0 * x[126] + ep2 * x[125] - x[128] * x[180]) - x[186] * x[190] -
+                             x[188] * x[190]);
     jac_ept2l[2] = x[189] * (l1 * (-ep1 * x[140] - ep2 * x[144] + x[147] * x[179]) +
-            l2 * (-ep0 * x[148] - ep2 * x[152] + x[154] * x[180]) - x[186] * x[191] -
-            x[188] * x[191]);
+                             l2 * (-ep0 * x[148] - ep2 * x[152] + x[154] * x[180]) - x[186] * x[191] -
+                             x[188] * x[191]);
     jac_ept2l[3] = x[192] * (-x[168] * x[194] + x[172] - x[193] * x[69]);
     jac_ept2l[4] = x[192] * (-x[173] * x[194] + x[176] - x[193] * x[74]);
     jac_ept2l[5] = x[184] * (x[177] * x[186] + x[177] * x[188] + x[178]);

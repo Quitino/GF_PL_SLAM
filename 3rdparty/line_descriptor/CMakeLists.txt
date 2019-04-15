@@ -2,8 +2,8 @@ project( line-descriptor )
 
 cmake_minimum_required(VERSION 2.7)
 
-# set( OpenCV_DIR /opt/ros/kinetic/share/OpenCV-3.3.1-dev )
-set( OpenCV_DIR /opt/opencv3/share/OpenCV )
+set( OpenCV_DIR /opt/ros/kinetic/share/OpenCV-3.3.1-dev )
+# set( OpenCV_DIR /opt/opencv3/share/OpenCV )
 find_package( OpenCV 3 REQUIRED)
 MESSAGE("OpenCV include dir: " ${OpenCV_INCLUDE_DIRS})
 

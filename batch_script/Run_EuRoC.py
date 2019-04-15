@@ -6,11 +6,10 @@ import time
 import signal
 
 # SeqNameList = ['MH_01_easy', 'MH_02_easy', 'MH_03_medium', 'MH_04_difficult', 'MH_05_difficult'];
-SeqNameList = ['V1_01_easy', 'V1_02_medium', 'V1_03_difficult', 'V2_01_easy', 'V2_02_medium', 'V2_03_difficult'];
-# SeqNameList = ['V2_03_difficult'];
-
-Result_root = '/mnt/DATA/tmp/EuRoC/Cut_PointLine/'
-
+# SeqNameList = ['V1_01_easy', 'V1_02_medium', 'V1_03_difficult', 'V2_01_easy', 'V2_02_medium', 'V2_03_difficult'];
+SeqNameList = ['V2_03_difficult'];
+Result_root = '/mnt/DATA/tmp/EuRoC/Cut_PointLine_1000_0.1/'
+# Result_root = '/mnt/DATA/tmp/LineCut/EuRoC_blur/'
 Num_Repeating = 1 # 10 # 20 # 5 # 
 
 #----------------------------------------------------------------------------------------------------------------------

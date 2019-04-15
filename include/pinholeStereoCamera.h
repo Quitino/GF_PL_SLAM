@@ -37,18 +37,9 @@ using namespace Eigen;
 class PinholeStereoCamera
 {
 
-private:
-    const int           width, height;
-    double              fx, fy;
-    double              cx, cy;
-    const double        b;
-    Matrix3d            K;
-    bool                dist;
-    Matrix<double,5,1>  d;
-    Mat                 Kl, Kr, Dl, Dr, Rl, Rr, Pl, Pr, R, t, Q;
-    Mat                 undistmap1l, undistmap2l, undistmap1r, undistmap2r;
-
 public:
+
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 
     PinholeStereoCamera( const int & width_, const int & height_,
                          const double & fx_, const double & fy_, const double & cx_, const double & cy_,
@@ -99,6 +90,17 @@ public:
     inline const double getCy()             const { return cy; };
     //
     inline const cv::Mat getKl()            const { return Kl; };
+
+private:
+    const int           width, height;
+    double              fx, fy;
+    double              cx, cy;
+    const double        b;
+    Matrix3d            K;
+    bool                dist;
+    Matrix<double,5,1>  d;
+    Mat                 Kl, Kr, Dl, Dr, Rl, Rr, Pl, Pr, R, t, Q;
+    Mat                 undistmap1l, undistmap2l, undistmap1r, undistmap2r;
 
 };
 

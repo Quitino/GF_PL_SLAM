@@ -50,6 +50,8 @@ class KeyFrame
 
 public:
 
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+
     KeyFrame(){};
     KeyFrame( const StVO::StereoFrame* sf );
     KeyFrame( const StVO::StereoFrame* sf, int kf_idx_ );
