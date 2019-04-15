@@ -25,10 +25,6 @@ Build the GF-PL-SLAM itself
 
 	./build.sh
 
-With the head version of g2o, it's possible to prompt error when building GF-PL-SLAM.  When getting error like "no matching function for BlockSolver XXX", refer to the fix at 
-
-	https://github.com/rubengooj/pl-slam/issues/29
-
 To run GF-PL-SLAM, please refer to some example batch evaluation scripts at folder 
 
 	batch_script
