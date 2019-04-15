@@ -26,7 +26,8 @@ sudo make install
 sudo apt-get install wx3.0-headers libwxgtk3.0-dev
 
 # MRPT (viz only)
-# NOTE the old mrpt only works with opencv earlier than 3.3.1, e.g. the opencv ships with ros kinetic 
+# NOTE the old mrpt only works with opencv no later than 3.3.1, e.g. the opencv ships with ros kinetic 
+# here I assume ros-kinectic already being installed; otherwise please build opencv-3.3.1 on your own
 cd ${DEPENDENCIES_DIR}
 git clone https://github.com/MRPT/mrpt.git
 cd mrpt
