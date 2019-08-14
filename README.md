@@ -1,5 +1,8 @@
 # Good Line Cutting Version of PL-SLAM
 
+[泡泡推荐词](https://mp.weixin.qq.com/s?__biz=MzI5MTM1MTQwMw==&mid=2247502108&idx=1&sn=d91e62173c9bb896a8485634035370eb&chksm=ec137718db64fe0e32d7b293a2ab6acf3a6aa8fc219678912aabb44ad0272aa22b3c65ba2374&mpshare=1&scene=1&srcid=&sharer_sharetime=1565752149716&sharer_shareid=7f2ef8062db941cd6f362e2b47bfec4b&pass_ticket=F%2FDcQUFoziFQRIZO5nFqbGSWQROwfTXyyFj%2B3FTug77yGQBpxqgMTzUTPyXdfXYW#rd)
+
+
 Good line cutting is an enhancement module that is designed for line-assisted VSLAM, such as PL-SLAM.  The primary objective of good line cutting is to pre-condition line-assisted pose optimization, therefore improving the robustness of optimization under 3D line triangulation error.
 
 <figure>
